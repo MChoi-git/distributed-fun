@@ -1,0 +1,37 @@
+#!/bin/bash
+#SBATCH --job-name=multinode_test
+#SBATCH --ntasks=2
+#SBATCH --nodes=2
+#SBATCH --mincpus=16
+#SBATCH --gres=gpu:2
+#SBATCH --mem=64G
+#SBATCH --partition=t4v2
+#SBATCH --qos=high
+#SBATCH --output=job_%x_%j.out
+#SBATCH --error=job_%x_%j.err
+
+# Set location of host and access port
+MAIN_HOST=`hostname -s`
+
+export MASTER_ADDR=$MAIN_HOST
+
+export MASTER_PORT=42069
+
+# Set NCCL options
+export NCCL_DEBUG=INFO
+export NCCL_IB_DISABLE=1
+
+if [[ "${SLURM_JOB_PARTITION}" == "t4v2" ]] || \
+    [[ "${SLURM_JOB_PARTITION}" == "rtx6000" ]]; then
+    echo export NCCL_SOCKET_IFNAME=bond0 on ${SLURM_JOB_PARTITION}
+    export NCCL_SOCKET_IFNAME=bond0
+fi
+
+mkdir -p workdir_${SLURM_JOB_ID}
+cp -r ./worker_script.sh  workdir_${SLURM_JOB_ID}/
+cp -r ./dummy_worker_script.py workdir_${SLURM_JOB_ID}/
+cd  workdir_${SLURM_JOB_ID}
+
+# Run on all nodes
+/opt/slurm/bin/srun --mem=64G bash -c \
+    "bash worker_script.sh $* >> log_for_\${SLURM_JOB_ID}_node_\${SLURM_PROCID}.log 2>&1"

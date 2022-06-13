@@ -62,9 +62,11 @@ class SelfAttention(nn.Module):
         qkv = self.fc1(x)
         qkv_heads = qkv.reshape(self.msa_heads, B, S, -1)
         q, k, v = torch.split(qkv_heads, qkv_heads.shape[-1] // 3, dim=-1)
-        qk_heads = torch.einsum("hbse,hbSe->hbsS", q, k) * (self.input_dim * 2) ** -0.5
+        qk_heads = (
+            torch.einsum("hbse,hbSe->hbsS", q, k) * (self.input_data_dim * 2) ** -0.5
+        )
         att_heads = F.softmax(qk_heads, dim=-1)
-        att_heads = self.dropout(att_heads)
+        att_heads = self.qkv_dropout(att_heads)
         full_att = torch.einsum("hbsS,hbSe->hbse", att_heads, v)
         full_att = full_att.reshape(B, S, -1)
         out = self.fc2(full_att)
@@ -120,6 +122,43 @@ class ModuleShard(nn.Module):
         return [rpc.RRef(p) for p in self.net.parameters()]
 
 
+class AsyncTransformerLayer(nn.Module):
+    def __init__(self, msa_worker_rrefs, mlp_worker_rrefs, layer_idx):
+        super(AsyncTransformerLayer, self).__init__()
+        self.msa_worker_rrefs = msa_worker_rrefs
+        self.mlp_worker_rrefs = mlp_worker_rrefs
+        self.layer_idx = layer_idx
+        self.lock = threading.Lock()
+
+    @rpc.functions.async_execution
+    def forward(self, x_rref):
+        fut = torch.futures.Future()
+        with self.lock:
+            msa_futures = []
+            for i, msa_worker in enumerate(self.msa_worker_rrefs):
+                y_msa = msa_worker.rpc_async().forward(x_rref)
+                msa_futures.append(y_msa)
+            msa_out = torch.cat(torch.futures.wait_all(msa_futures), dim=-1)
+
+            mlp_futures = []
+            for j, mlp_worker in enumerate(self.mlp_worker_rrefs):
+                msa_out_rref = rpc.RRef(msa_out)
+                y_mlp = mlp_worker.rpc_async().forward(msa_out_rref)
+                mlp_futures.append(y_mlp)
+            mlp_out = torch.sum(torch.stack(torch.futures.wait_all(mlp_futures)), dim=0)
+
+            fut.set_result(mlp_out)
+        return fut
+
+    def parameter_rrefs(self):
+        remote_params = []
+        for msa_worker in self.msa_worker_rrefs:
+            remote_params.extend(msa_worker.remote().parameter_rrefs().to_here())
+        for mlp_worker in self.mlp_worker_rrefs:
+            remote_params.extend(mlp_worker.remote().parameter_rrefs().to_here())
+        return remote_params
+
+
 class AsyncLayer(nn.Module):
     def __init__(self, worker_rrefs, layer_idx):
         super(AsyncLayer, self).__init__()
@@ -131,8 +170,8 @@ class AsyncLayer(nn.Module):
     def forward(self, x_rref):
 
         x_input = x_rref.to_here()
+        fut = torch.futures.Future()
         with self.lock:
-            fut = torch.futures.Future()
             x_chunks = torch.chunk(x_input, len(self.worker_rrefs), dim=-1)
 
             out_futures = []
@@ -180,8 +219,6 @@ class DistributedModel(nn.Module):
         out = torch.cat(torch.futures.wait_all(out_futures), dim=0)
         logging.info("Finished dist forward")
 
-        #logging.info(f"Profile: {prof.key_averages().table()}")
-
         return out
 
     def parameter_rrefs(self):
@@ -189,6 +226,74 @@ class DistributedModel(nn.Module):
         for layer_rref in self.async_layer_rrefs:
             remote_params.extend(layer_rref.remote().parameter_rrefs().to_here())
         return remote_params
+
+
+def run_master_transformer(local_world_size):
+    logging.info("Master transformer running~")
+
+    worker1_msa_rref = rpc.remote(
+        "worker1",
+        ModuleShard,
+        args=(1, local_world_size, SelfAttention, 128, 64, 4, 0.1, 0.1),
+    )
+    worker2_msa_rref = rpc.remote(
+        "worker2",
+        ModuleShard,
+        args=(2, local_world_size, SelfAttention, 128, 64, 4, 0.1, 0.1),
+    )
+    worker3_msa_rref = rpc.remote(
+        "worker3",
+        ModuleShard,
+        args=(3, local_world_size, SelfAttention, 128, 128, 4, 0.1, 0.1),
+    )
+    worker1_mlp_rref = rpc.remote(
+        "worker1", ModuleShard, args=(1, local_world_size, MLP, 128)
+    )
+    worker2_mlp_rref = rpc.remote(
+        "worker2", ModuleShard, args=(2, local_world_size, MLP, 128)
+    )
+    worker3_mlp_rref = rpc.remote(
+        "worker3", ModuleShard, args=(3, local_world_size, MLP, 128)
+    )
+
+    async_layer1_rrefs = [
+        [worker1_msa_rref, worker2_msa_rref],
+        [worker1_mlp_rref, worker2_mlp_rref],
+    ]
+    async_layer2_rrefs = [[worker3_msa_rref], [worker3_mlp_rref]]
+
+    layer1_shard_rref = rpc.remote(
+        "worker1", AsyncTransformerLayer, args=(*async_layer1_rrefs, 0)
+    )
+    layer2_shard_rref = rpc.remote(
+        "worker3", AsyncTransformerLayer, args=(*async_layer2_rrefs, 1)
+    )
+
+    model = DistributedModel(async_layer_rrefs=(layer1_shard_rref, layer2_shard_rref))
+
+    loss_fn = nn.MSELoss()
+
+    opt = DistributedOptimizer(
+        torch.optim.SGD,
+        model.parameter_rrefs(),
+        lr=3e-3,
+    )
+
+    data = torch.randn(100, 64, 512, 128)  # (num_baches, batch_size, features)
+    labels = torch.randn(100, 64, 512, 128)
+
+    for i, (batch, y) in enumerate(zip(data, labels)):
+        logging.info(f"Processing batch {i}")
+
+        with dist_autograd.context() as context_id:
+            outputs = model(batch)
+
+            loss = loss_fn(outputs.squeeze(), y)
+            logging.info(f"Batch {i} loss: {loss}")
+
+            dist_autograd.backward(context_id, [loss])
+
+            opt.step(context_id)
 
 
 def run_master(local_world_size):
@@ -208,9 +313,7 @@ def run_master(local_world_size):
     async_layer_rrefs = [worker1_model_rref, worker2_model_rref]
     layer1_shard_rref = rpc.remote("worker1", AsyncLayer, args=(async_layer_rrefs, 0))
 
-    model = DistributedModel(
-        async_layer_rrefs=(layer1_shard_rref, worker3_model_rref)
-    )
+    model = DistributedModel(async_layer_rrefs=(layer1_shard_rref, worker3_model_rref))
 
     loss_fn = nn.MSELoss()
 
@@ -220,7 +323,7 @@ def run_master(local_world_size):
         lr=3e-3,
     )
 
-    data = torch.randn(100, 64, 128)    # (num_baches, batch_size, features)
+    data = torch.randn(100, 64, 128)  # (num_baches, batch_size, features)
     labels = torch.tile(torch.arange(64), (100, 1)).float()
 
     for i, (batch, y) in enumerate(zip(data, labels)):
@@ -261,7 +364,7 @@ def run_worker(rank, node_rank, local_world_size, world_size, master_addr, maste
             rpc_backend_options=options,
         )
         logging.info(f"Master on rank {global_rank} initialized")
-        run_master(local_world_size)
+        run_master_transformer(local_world_size)
 
     else:
         rpc.init_rpc(

@@ -38,6 +38,9 @@ class MLP(nn.Module):
         z = self.fc2(y)
         return z
 
+    def parameter_count(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
 
 class SelfAttention(nn.Module):
     """Non-distributed self attention module"""
@@ -72,6 +75,9 @@ class SelfAttention(nn.Module):
         out = self.fc2(full_att)
         out = self.msa_dropout(out)
         return out
+
+    def parameter_count(self):
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
 class Dense(nn.Module):
@@ -118,6 +124,9 @@ class ModuleShard(nn.Module):
             out = self.net(x)
         return out.cpu()
 
+    def parameter_count(self):
+        return self.net.parameter_count()
+
     def parameter_rrefs(self):
         return [rpc.RRef(p) for p in self.net.parameters()]
 
@@ -149,6 +158,14 @@ class AsyncTransformerLayer(nn.Module):
 
             fut.set_result(mlp_out)
         return fut
+
+    def parameter_count(self):
+        params_count = 0
+        for msa_worker in self.msa_worker_rrefs:
+            params_count += msa_worker.remote().parameter_count().to_here()
+        for mlp_worker in self.mlp_worker_rrefs:
+            params_count += mlp_worker.remote().parameter_count().to_here()
+        return params_count
 
     def parameter_rrefs(self):
         remote_params = []
@@ -221,6 +238,12 @@ class DistributedModel(nn.Module):
 
         return out
 
+    def parameter_count(self):
+        params_count = 0
+        for layer_rref in self.async_layer_rrefs:
+            params_count += layer_rref.remote().parameter_count().to_here()
+        return params_count
+
     def parameter_rrefs(self):
         remote_params = []
         for layer_rref in self.async_layer_rrefs:
@@ -229,31 +252,36 @@ class DistributedModel(nn.Module):
 
 
 def run_master_transformer(local_world_size):
+    hidden_size = 2048
+    seq_len = 512
+
+    logging.info(f"Running with hidden size: {hidden_size}, sequence length: {seq_len}")
+
     logging.info("Master transformer running~")
 
     worker1_msa_rref = rpc.remote(
         "worker1",
         ModuleShard,
-        args=(1, local_world_size, SelfAttention, 128, 64, 4, 0.1, 0.1),
+        args=(1, local_world_size, SelfAttention, hidden_size, hidden_size // 2, 4, 0.1, 0.1),
     )
     worker2_msa_rref = rpc.remote(
         "worker2",
         ModuleShard,
-        args=(2, local_world_size, SelfAttention, 128, 64, 4, 0.1, 0.1),
+        args=(2, local_world_size, SelfAttention, hidden_size, hidden_size // 2, 4, 0.1, 0.1),
     )
     worker3_msa_rref = rpc.remote(
         "worker3",
         ModuleShard,
-        args=(3, local_world_size, SelfAttention, 128, 128, 4, 0.1, 0.1),
+        args=(3, local_world_size, SelfAttention, hidden_size, hidden_size, 4, 0.1, 0.1),
     )
     worker1_mlp_rref = rpc.remote(
-        "worker1", ModuleShard, args=(1, local_world_size, MLP, 128)
+        "worker1", ModuleShard, args=(1, local_world_size, MLP, hidden_size)
     )
     worker2_mlp_rref = rpc.remote(
-        "worker2", ModuleShard, args=(2, local_world_size, MLP, 128)
+        "worker2", ModuleShard, args=(2, local_world_size, MLP, hidden_size)
     )
     worker3_mlp_rref = rpc.remote(
-        "worker3", ModuleShard, args=(3, local_world_size, MLP, 128)
+        "worker3", ModuleShard, args=(3, local_world_size, MLP, hidden_size)
     )
 
     async_layer1_rrefs = [
@@ -271,6 +299,8 @@ def run_master_transformer(local_world_size):
 
     model = DistributedModel(async_layer_rrefs=(layer1_shard_rref, layer2_shard_rref))
 
+    logging.info(f"Model parameter count: {model.parameter_count()}")
+
     loss_fn = nn.MSELoss()
 
     opt = DistributedOptimizer(
@@ -279,8 +309,8 @@ def run_master_transformer(local_world_size):
         lr=3e-3,
     )
 
-    data = torch.randn(100, 64, 512, 128)  # (num_baches, batch_size, features)
-    labels = torch.randn(100, 64, 512, 128)
+    data = torch.randn(100, 64, seq_len, hidden_size)  # (num_baches, batch_size, features)
+    labels = torch.randn(100, 64, seq_len, hidden_size)
 
     for i, (batch, y) in enumerate(zip(data, labels)):
         logging.info(f"Processing batch {i}")

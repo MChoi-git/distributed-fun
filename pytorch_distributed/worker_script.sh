@@ -33,4 +33,5 @@ python dummy_worker_script.py --nnodes ${SLURM_NNODES} \
 	--node_rank ${SLURM_NODEID} \
 	--nproc_per_node ${NUM_GPUs} \
 	--master_addr ${MASTER_ADDR} \
-	--master_port ${MASTER_PORT}
+	--master_port ${MASTER_PORT} \
+	--slurm_job_id ${SLURM_JOB_ID}

@@ -5,3 +5,13 @@ data/
 
 workdir*
 misc/
+
+*.txt
+tiny_shakespeare/
+tokenizer_shakespeare/
+tokenizer_wikitext-103/
+dset_json_temp/
+archive/
+checkpoints/
+
+__pycache__/

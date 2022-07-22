@@ -38,7 +38,7 @@ def parse_args():
     parser.add_argument(
         "--checkpoint_dir",
         type=str,
-        default="/h/mchoi/distributed/jax_distributed/checkpoints",
+        default="/h/mchoi/distributed/jax_transformer/checkpoints",
     )
     parser.add_argument(
         "--exp_id",
@@ -48,17 +48,17 @@ def parse_args():
     parser.add_argument(
         "--dset_path",
         type=str,
-        default="/h/mchoi/distributed/jax_distributed"
+        default="/h/mchoi/distributed/jax_transformer"
     )
     parser.add_argument(
         "--corpus_save_path",
         type=str,
-        default="/h/mchoi/distributed/jax_distributed"
+        default="/h/mchoi/distributed/jax_transformer"
     )
     parser.add_argument(
         "--tokenizer_save_path",
         type=str,
-        default="/h/mchoi/distributed/jax_distributed/tokenizer_shakespeare",
+        default="/h/mchoi/distributed/jax_transformer/tokenizer_shakespeare",
     )
     parser.add_argument("--inference", type=int, default=0)
     args = parser.parse_args()

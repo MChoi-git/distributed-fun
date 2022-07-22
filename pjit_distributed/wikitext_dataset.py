@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 from datasets import load_dataset
 from tokenizers import Tokenizer
@@ -10,6 +11,32 @@ from tokenizers import (
     decoders,
 )
 from transformers import PreTrainedTokenizerFast
+
+
+def setup_wikitext_dataset_and_tokenizer(
+    json_save_dir,
+    tokenizer_save_dir,
+    wikitext_script_path,
+    wikitext_name,
+    max_vocab_size,
+    seq_len
+):
+    working_dir = Path(os.getcwd())
+    json_save_dir = working_dir / json_save_dir
+    tokenizer_save_dir = working_dir / tokenizer_save_dir
+
+    dset_tuple = make_wikitext_dataset(wikitext_script_path, wikitext_name)
+    tokenizer = make_wikitext_tokenizer(
+        dset_tuple,
+        max_vocab_size,
+        seq_len,
+        json_save_dir,
+        tokenizer_save_dir,
+    )
+
+    out = tokenizer, *dset_tuple
+
+    return out
 
 
 def make_wikitext_dataset(path, name):

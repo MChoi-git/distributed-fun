@@ -4,7 +4,7 @@ from jax.experimental import maps
 
 import flax
 
-from model_parallel import TransformerInit
+from model_parallel import ModuleMetadataManager
 
 
 def verify_module_metadata(
@@ -29,12 +29,14 @@ def verify_module_metadata(
             **module_metadata.init_kwargs,
         )
 
-        dist_layer = TransformerInit(mesh, 1, [module_metadata])
+        dist_layer = ModuleMetadataManager(mesh, 1, [module_metadata])
         dist_params = dist_layer.init_from_pjit_metadata(const_layer_end_idx=1)
         dist_layer.forward_from_pjit_metadata(const_layer_end_idx=1)
 
         # Make sure that parameters are the same
-        for single_p, dist_p in zip(jax.tree_leaves(single_params), jax.tree_leaves(dist_params)):
+        for single_p, dist_p in zip(
+            jax.tree_leaves(single_params), jax.tree_leaves(dist_params)
+        ):
             assert jnp.allclose(single_p, dist_p)
 
         return single_params, dist_params, dist_layer
@@ -56,9 +58,7 @@ def verify_module_metadata(
 
         with maps.Mesh(mesh.devices, mesh.axis_names):
             dist_out = dist_layer.module_metadata_list[0].pjit_forward(
-                dist_params,
-                data,
-                None
+                dist_params, data, None
             )
 
         return single_out, dist_out, jnp.allclose(single_out, dist_out, atol=atol)

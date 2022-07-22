@@ -1,15 +1,11 @@
 from typing import Union, Callable, Tuple, Dict, Any, List
 from dataclasses import dataclass
-from functools import partial
 
 import jax
 from jax import numpy as jnp, random
 from jax.experimental import maps, PartitionSpec
 from jax.experimental.pjit import pjit
-import flax
 import flax.linen as nn
-
-from layers import MaskedMSA, MLP
 
 
 class ModelParallelMaskedMSA(nn.Module):
@@ -217,47 +213,41 @@ def generic_pjit_forward_fn(module_metadata):
 
 @dataclass
 class ModuleMetadata:
-    """Metadata object that holds all necessary information for each
+    """
+    Metadata object that holds all necessary information for each
     megatron transformer layer.
     """
+
     rng: jax._src.prng.PRNGKeyArray
     name: str
+
+    # Partition specs for module.init and module.apply
     in_init_pspec: Union[PartitionSpec, None]
     out_init_pspec: Union[PartitionSpec, None]
     in_train_pspec: Union[PartitionSpec, None]
     out_train_pspec: Union[PartitionSpec, None]
+
+    # Layer expected input metadata
     layer: nn.Module
     data_shape: Tuple[int]
     dtype: jax._src.numpy.lax_numpy._ScalarMeta
+
+    # Args for initializing the module and training the the module
     module_init_args: Union[Tuple, dict, None]
     init_args: Union[Tuple, dict, None] = None
     init_kwargs: Union[Dict[str, Any], None] = None
     train_args: Union[Tuple, None] = None
     train_kwargs: Union[Dict[str, Any], None] = None
 
+    # pjit functions for initialization and forward
     pjit_init: Union[Callable, None] = None
     pjit_forward: Union[Callable, None] = None
 
-    def __post_init__(self):
-        if self.module_init_args is None:
-            self.module_init_args = ()
-
-        if self.init_args is None:
-            self.init_args = ()
-
-        if self.init_kwargs is None:
-            self.init_kwargs = {}
-
-        if self.train_args is None:
-            self.train_args = ()
-
-        if self.train_kwargs is None:
-            self.train_kwargs = {}
-
 
 @dataclass
-class TransformerInit:
-    """Class which handles metadata allocation for each layer in the
+class ModuleMetadataManager:
+    """
+    Class which handles metadata allocation for each layer in the
     transformer. Creates both the pjit functions to init parameters, and
     the pjit functions to do forward passes.
     """
@@ -267,15 +257,30 @@ class TransformerInit:
 
     def __post_init__(self):
         jax.tree_util.tree_map(
-            lambda meta: setattr(meta, "layer", meta.layer(*meta.module_init_args)),
+            lambda meta: setattr(
+                meta,
+                "layer",
+                meta.layer(*meta.module_init_args)
+            ),
             self.module_metadata_list,
         )
 
     def bind_pjit_fns(self, pjit_fns, attribute):
+        """
+        Attach the given pjit_fns to the specified attribute in the
+        ModuleMetadata object.
+        """
         for meta, fn in zip(self.module_metadata_list, pjit_fns):
             setattr(meta, attribute, fn)
 
     def init_from_pjit_metadata(self, const_layer_end_idx):
+        """
+        Initialize the collection of ModuleMetadata objects using their
+        initialization arguments. The resulting parameters are sharded
+        according to their initialization PartitionSpecs, and returned in a
+        separate dictionary. The pjit_init functions are also saved in each
+        respective ModuleMetadata object.
+        """
         # Generate pjit functions for each layer type
         pjit_fns = jax.tree_util.tree_map(
             generic_pjit_init_fn, self.module_metadata_list
@@ -290,14 +295,14 @@ class TransformerInit:
 
         # Create sharded parameters for each layer
         with maps.Mesh(self.mesh.devices, self.mesh.axis_names):
-            # Core only need one set of parameters
+            # Core layers exist once in model
             core_params = jax.tree_util.tree_map(
                 lambda meta: meta[2](jnp.ones(meta[0], dtype=meta[1])),
                 core_pjit_fns,
                 is_leaf=lambda x: isinstance(x, tuple) and len(x) == 3,
             )
 
-            # Multilayer require a set of parameters per layer
+            # Multilayer layers exist num_layers times in model
             multilayer_params = {}
             for i in range(self.num_layers):
                 params = jax.tree_util.tree_map(
@@ -328,6 +333,12 @@ class TransformerInit:
         return full_params_dict
 
     def forward_from_pjit_metadata(self, const_layer_end_idx):
+        """
+        Create the forward pjit functions for each ModuleMetadata object in
+        the collection, according to its specific training arguments and
+        PartitionSpecs. Save these pjit forward functions in each respective
+        ModuleMetadata object.
+        """
         # Core forward functions, ie. __call__ methods
         pjit_fns = jax.tree_util.tree_map(
             generic_pjit_forward_fn, self.module_metadata_list
@@ -347,10 +358,16 @@ class TransformerInit:
             ],
             out_axis_resources=PartitionSpec(None, None, "tp"),
         )
-        setattr(self.module_metadata_list[0], "pjit_forward_attend", output_embed_attend_fn)
+        setattr(
+            self.module_metadata_list[0], "pjit_forward_attend", output_embed_attend_fn
+        )
 
     @staticmethod
     def inspect_params(param_tree):
+        """
+        Return a pytree where the leaves are the shape of the sharded
+        parameters.
+        """
         tree_shape = jax.tree_util.tree_map(
             lambda param: jax.tree_util.tree_map(
                 lambda p: p.shape,
@@ -361,22 +378,12 @@ class TransformerInit:
         return tree_shape
 
 
-def test_forward_correctness(all_params, module_metadata_list, inputs, mesh, num_layers, dropout_rng_key):
-    qkv_dropout, msa_dropout, mlp_dropout = random.split(dropout_rng_key, num=3)
-
-    with maps.Mesh(mesh.devices, mesh.axis_names):
-        x = inputs
-
-        core_params = all_params["core_params"]
-
-        embeds = module_metadata_list[0].pjit_forward(
-            core_params["embed"], x, None
-        )
-
-
-def forward(all_params, module_metadata_list, inputs, mesh, num_layers, dropout_rng_key):
-    """Forward pass for transformer. Uses binded params and pjit functions from
-    module_metadata_list container
+def forward(
+    all_params, module_metadata_list, inputs, mesh, num_layers, dropout_rng_key
+):
+    """
+    Forward pass for transformer. Uses binded params and pjit functions from
+    module_metadata_list container.
     """
     qkv_dropout, msa_dropout, mlp_dropout = random.split(dropout_rng_key, num=3)
 
@@ -391,9 +398,7 @@ def forward(all_params, module_metadata_list, inputs, mesh, num_layers, dropout_
         # Core params forward
         core_params = all_params["core_params"]
 
-        embeds = module_metadata_list[0].pjit_forward(
-            core_params["embed"], x, None
-        )
+        embeds = module_metadata_list[0].pjit_forward(core_params["embed"], x, None)
 
         core_input = module_metadata_list[1].pjit_forward(
             core_params["pos_embed"], embeds, None
@@ -421,7 +426,9 @@ def forward(all_params, module_metadata_list, inputs, mesh, num_layers, dropout_
                 multilayer_params["mlp_col"][i], ln_mlp, None
             )
             mlp_row_out = module_metadata_list[7].pjit_forward(
-                multilayer_params["mlp_row"][i], mlp_col_out, {"dropout": mlp_dropout},
+                multilayer_params["mlp_row"][i],
+                mlp_col_out,
+                {"dropout": mlp_dropout},
             )
             core_input = mlp_row_out + msa_res_out
 
@@ -432,7 +439,17 @@ def forward(all_params, module_metadata_list, inputs, mesh, num_layers, dropout_
     return out
 
 
-def softmax_cross_entropy_loss(all_params, module_metadata_list, x_batched, labels, mesh, num_layers, vocab_size, dropout_rng_key, label_smoothing):
+def softmax_cross_entropy_loss(
+    all_params,
+    module_metadata_list,
+    x_batched,
+    labels,
+    mesh,
+    num_layers,
+    vocab_size,
+    dropout_rng_key,
+    label_smoothing,
+):
     def cross_entropy(x, y):
         smooth_label = jnp.where(
             jax.nn.one_hot(y, vocab_size) == 0,
@@ -441,7 +458,9 @@ def softmax_cross_entropy_loss(all_params, module_metadata_list, x_batched, labe
         )
         return -jnp.sum(smooth_label * jnp.clip(jnp.log(x), a_min=-100))
 
-    preds_batched = forward(all_params, module_metadata_list, x_batched, mesh, num_layers, dropout_rng_key)
+    preds_batched = forward(
+        all_params, module_metadata_list, x_batched, mesh, num_layers, dropout_rng_key
+    )
 
     softmax_preds_batched = jax.nn.softmax(preds_batched, axis=-1)
 

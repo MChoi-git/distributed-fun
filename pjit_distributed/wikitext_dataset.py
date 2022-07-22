@@ -19,7 +19,7 @@ def setup_wikitext_dataset_and_tokenizer(
     wikitext_script_path,
     wikitext_name,
     max_vocab_size,
-    seq_len
+    seq_len,
 ):
     working_dir = Path(os.getcwd())
     json_save_dir = working_dir / json_save_dir
@@ -48,7 +48,9 @@ def make_wikitext_dataset(path, name):
     return test_dset, train_dset, val_dset
 
 
-def make_wikitext_tokenizer(dsets, max_vocab_size, seq_len, temp_save_dir, tokenizer_save_dir):
+def make_wikitext_tokenizer(
+    dsets, max_vocab_size, seq_len, temp_save_dir, tokenizer_save_dir
+):
     if os.path.isdir(tokenizer_save_dir):
         return PreTrainedTokenizerFast.from_pretrained(
             pretrained_model_name_or_path=tokenizer_save_dir
@@ -99,7 +101,7 @@ def make_wikitext_tokenizer(dsets, max_vocab_size, seq_len, temp_save_dir, token
         special_tokens=[
             ("[BOS]", tokenizer.token_to_id("[BOS]")),
             ("[EOS]", tokenizer.token_to_id("[EOS]")),
-        ]
+        ],
     )
 
     tokenizer.decoder = decoders.ByteLevel()

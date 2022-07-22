@@ -8,12 +8,12 @@ from jax.experimental import maps, PartitionSpec
 import flax.linen as nn
 import numpy as np
 
-from wikitext_dataset import(
+from wikitext_dataset import (
     make_wikitext_dataset,
     make_wikitext_tokenizer,
     setup_wikitext_dataset_and_tokenizer,
 )
-from model_parallel import(
+from model_parallel import (
     ModelParallelMaskedMSA,
     RowParallelLinear,
     ColumnParallelLinear,
@@ -127,7 +127,9 @@ def main(args):
     # Make the dummy init/forward data
     main_key, dummy_key, verify_key = random.split(main_key, num=3)
 
-    single_out, dist_out, result = verify_module_metadata(verify_key, mesh, dist_module, "core_params", "embed")
+    single_out, dist_out, result = verify_module_metadata(
+        verify_key, mesh, dist_module, "core_params", "embed"
+    )
 
     breakpoint()
 

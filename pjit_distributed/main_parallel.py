@@ -1,7 +1,5 @@
 import argparse
-import os
 import logging
-from pathlib import Path
 
 import jax
 from jax import numpy as jnp, random
@@ -9,8 +7,6 @@ from jax.experimental import maps, PartitionSpec
 import numpy as np
 
 from wikitext_dataset import (
-    make_wikitext_dataset,
-    make_wikitext_tokenizer,
     setup_wikitext_dataset_and_tokenizer,
 )
 from model_parallel import (
@@ -21,9 +17,9 @@ from model_parallel import (
     PositionEmbed,
     Layernorm,
     ModuleMetadata,
-    TransformerInit,
+    ModuleMetadataManager,
     forward,
-    softmax_cross_entropy_loss
+    softmax_cross_entropy_loss,
 )
 from test_utils import verify_module_metadata
 
@@ -44,13 +40,13 @@ def parse_args():
     parser.add_argument(
         "--checkpoint_dir",
         type=str,
-        default="/h/mchoi/distributed/jax_distributed/checkpoints",
+        default="/h/mchoi/distributed/pjit_distributed/checkpoints",
     )
     parser.add_argument("--exp_id", type=str, default="DEFAULT_MP")
     parser.add_argument(
         "--wikitext_script_path",
         type=str,
-        default="/h/mchoi/distributed/jax_distributed/wikitext.py",
+        default="/h/mchoi/distributed/pjit_distributed/wikitext.py",
     )
     parser.add_argument("--wikitext_name", type=str, default="wikitext-103-v1")
     parser.add_argument(
@@ -71,14 +67,14 @@ def parse_args():
 
 
 def get_mesh(x, y):
-        mesh_shape = (x, y)  # x: DP, y: MP
-        assert len(jax.devices()) == x * y
+    mesh_shape = (x, y)  # x: DP, y: MP
+    assert len(jax.devices()) == x * y
 
-        available_devices = jax.devices()
-        devices = np.asarray(available_devices).reshape(*mesh_shape)
-        mesh = maps.Mesh(devices, ("tp", "pp"))
+    available_devices = jax.devices()
+    devices = np.asarray(available_devices).reshape(*mesh_shape)
+    mesh = maps.Mesh(devices, ("tp", "pp"))
 
-        return mesh
+    return mesh
 
 
 def main(args):
@@ -117,10 +113,10 @@ def main(args):
         data_shape=(args.batch_size, args.seq_len),
         dtype=jnp.int32,
         module_init_args=(args.max_vocab_size, args.hidden),
-        init_args=None,
-        init_kwargs=None,
-        train_args=None,
-        train_kwargs=None,
+        init_args=(),
+        init_kwargs={},
+        train_args=(),
+        train_kwargs={},
     )
     pos_embed_metadata = ModuleMetadata(
         rng=sk2,
@@ -133,10 +129,10 @@ def main(args):
         data_shape=(args.batch_size, args.seq_len, args.hidden),
         dtype=jnp.float32,
         module_init_args=(args.seq_len, args.hidden),
-        init_args=None,
-        init_kwargs=None,
-        train_args=None,
-        train_kwargs=None,
+        init_args=(),
+        init_kwargs={},
+        train_args=(),
+        train_kwargs={},
     )
     layernorm_msa_metadata = ModuleMetadata(
         rng=sk3,
@@ -148,11 +144,11 @@ def main(args):
         layer=Layernorm,
         data_shape=(args.batch_size, args.seq_len, args.hidden),
         dtype=jnp.float32,
-        module_init_args=None,
-        init_args=None,
-        init_kwargs=None,
-        train_args=None,
-        train_kwargs=None,
+        module_init_args=(),
+        init_args=(),
+        init_kwargs={},
+        train_args=(),
+        train_kwargs={},
     )
     msa_attn_metadata = ModuleMetadata(
         rng=sk4,
@@ -165,9 +161,9 @@ def main(args):
         data_shape=(args.batch_size, args.seq_len, args.hidden),
         dtype=jnp.float32,
         module_init_args=(args.hidden, args.num_heads, 0.1),
-        init_args=None,
+        init_args=(),
         init_kwargs={"train": False},
-        train_args=None,
+        train_args=(),
         train_kwargs={"train": True},
     )
     msa_mlp_metadata = ModuleMetadata(
@@ -185,9 +181,9 @@ def main(args):
         data_shape=(args.batch_size, args.seq_len, args.hidden),
         dtype=jnp.float32,
         module_init_args=(args.hidden, 0.1),
-        init_args=None,
+        init_args=(),
         init_kwargs={"train": False},
-        train_args=None,
+        train_args=(),
         train_kwargs={"train": True},
     )
     layernorm_mlp_metadata = ModuleMetadata(
@@ -200,11 +196,11 @@ def main(args):
         layer=Layernorm,
         data_shape=(args.batch_size, args.seq_len, args.hidden),
         dtype=jnp.float32,
-        module_init_args=None,
-        init_args=None,
-        init_kwargs=None,
-        train_args=None,
-        train_kwargs=None,
+        module_init_args=(),
+        init_args=(),
+        init_kwargs={},
+        train_args=(),
+        train_kwargs={},
     )
     mlp_col_metadata = ModuleMetadata(
         rng=sk7,
@@ -217,9 +213,9 @@ def main(args):
         data_shape=(args.batch_size, args.seq_len, args.hidden),
         dtype=jnp.float32,
         module_init_args=(args.hidden, 0),
-        init_args=None,
+        init_args=(),
         init_kwargs={"train": False},
-        train_args=None,
+        train_args=(),
         train_kwargs={"train": True},
     )
     mlp_row_metadata = ModuleMetadata(
@@ -237,9 +233,9 @@ def main(args):
         data_shape=(args.batch_size, args.seq_len, args.hidden),
         dtype=jnp.float32,
         module_init_args=(args.hidden, 0.1),
-        init_args=None,
+        init_args=(),
         init_kwargs={"train": False},
-        train_args=None,
+        train_args=(),
         train_kwargs={"train": True},
     )
 
@@ -264,10 +260,7 @@ def main(args):
         module_metadata.train_kwargs["train"] = False
 
         single_out, dist_out, result = verify_module_metadata(
-            sk,
-            mesh,
-            module_metadata,
-            atol=1e-6
+            sk, mesh, module_metadata, atol=1e-6
         )
 
         module_metadata.train_kwargs["train"] = True
@@ -276,32 +269,31 @@ def main(args):
         dist_outs[module_metadata.name] = dist_out
         results[module_metadata.name] = result
 
-    overall = (sum(results.values()) == len(results))
+    overall = sum(results.values()) == len(results)
 
     if overall.item() is False:
         raise Exception("Some layer(s) do not have correct outputs")
 
     breakpoint()
 
-    transformer = TransformerInit(mesh, args.num_layers, module_metadata_list)
+    transformer = ModuleMetadataManager(mesh, args.num_layers, module_metadata_list)
 
     # Constuct pjit functions for initializing params and layer forward passes
     params = transformer.init_from_pjit_metadata(const_layer_end_idx=2)
     transformer.forward_from_pjit_metadata(const_layer_end_idx=2)
 
     def encode(batch, tokenizer):
-        return tokenizer(
-            batch["text"], padding="max_length", truncation=True
-        )
+        return tokenizer(batch["text"], padding="max_length", truncation=True)
 
     main_key, sk = random.split(main_key)
+
     def get_batch_indices(key, num_batches, train_dset, batch_size):
         dset_indices = jnp.arange(len(train_dset))
-        batch_indices_dropped = dset_indices[:num_batches * batch_size]    # drop last
+        batch_indices_dropped = dset_indices[: num_batches * batch_size]  # drop last
         return batch_indices_dropped
 
     num_batches = len(train_dset) // args.batch_size
-    
+
     for i in range(args.num_epochs):
         train_dset = train_dset.shuffle(seed=i)
         val_dset = val_dset.shuffle(seed=i)
@@ -315,7 +307,7 @@ def main(args):
             # Get batch
             low = j
             high = j + args.batch_size
-            batch_slice = batch_indices[low: high]
+            batch_slice = batch_indices[low:high]
             batch = encode(train_dset[batch_slice], tokenizer)
             batch = jnp.array(batch["input_ids"])
 

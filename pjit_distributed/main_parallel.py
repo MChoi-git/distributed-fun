@@ -5,6 +5,8 @@ import jax
 from jax import numpy as jnp, random
 from jax.experimental import maps, PartitionSpec
 import numpy as np
+import optax
+import chex
 
 from wikitext_dataset import (
     setup_wikitext_dataset_and_tokenizer,
@@ -21,7 +23,7 @@ from model_parallel import (
     forward,
     softmax_cross_entropy_loss,
 )
-from test_utils import verify_module_metadata
+from test_utils import verify_module_metadata, verify_dist_model
 
 
 def parse_args():
@@ -250,80 +252,78 @@ def main(args):
         mlp_row_metadata,
     ]
 
-    # Check for correctness with non-distributed modules
-    single_outs = {}
-    dist_outs = {}
-    results = {}
-    for module_metadata in module_metadata_list:
-        main_key, sk = random.split(main_key)
-
-        module_metadata.train_kwargs["train"] = False
-
-        single_out, dist_out, result = verify_module_metadata(
-            sk, mesh, module_metadata, atol=1e-6
-        )
-
-        module_metadata.train_kwargs["train"] = True
-
-        single_outs[module_metadata.name] = single_out
-        dist_outs[module_metadata.name] = dist_out
-        results[module_metadata.name] = result
-
-    overall = sum(results.values()) == len(results)
-
-    if overall.item() is False:
-        raise Exception("Some layer(s) do not have correct outputs")
-
-    breakpoint()
-
+    # Create transformer model metadata manager
+    main_key, verification_key = random.split(main_key)
     transformer = ModuleMetadataManager(mesh, args.num_layers, module_metadata_list)
-
-    # Constuct pjit functions for initializing params and layer forward passes
     params = transformer.init_from_pjit_metadata(const_layer_end_idx=2)
     transformer.forward_from_pjit_metadata(const_layer_end_idx=2)
 
+    # Verify that the pjit layer function is identical to running the layer on
+    # one GPU
+    dist_verification = verify_dist_model(
+        verification_key,
+        mesh,
+        transformer,
+    )
+    assert dist_verification.item() is True, "Dist layer(s) have different" "outputs"
+
     def encode(batch, tokenizer):
-        return tokenizer(batch["text"], padding="max_length", truncation=True)
+        """Helper function using tokenizer to encode dataset batch"""
+        encoded_batch = jnp.array(
+            tokenizer(
+                batch["text"],
+                padding="max_length",
+                truncation=True,
+            )
+        )
+        return encoded_batch
 
-    main_key, sk = random.split(main_key)
-
-    def get_batch_indices(key, num_batches, train_dset, batch_size):
-        dset_indices = jnp.arange(len(train_dset))
-        batch_indices_dropped = dset_indices[: num_batches * batch_size]  # drop last
-        return batch_indices_dropped
-
+    # Start training loop
     num_batches = len(train_dset) // args.batch_size
 
+    # Create optimizer
+    # TODO: Need to find how to shard adam states, since it triples the
+    #       model parameters
+    optim = optax.adamw(learning_rate=args.lr, weight_decay=args.wd)
+    opt_state = optim.init(params)
+
+    def train_step(
+        key, opt_state, optim, params, module_metadata_manager, batch, labels, vocab_size, label_smoothing
+    ):
+        """Calculates loss and applies gradient for one training step"""
+        loss_value, grads = jax.value_and_grad(softmax_cross_entropy_loss)(
+            subkey,
+            params,
+            transformer,
+            batch,
+            batch,
+            mesh,
+            args.num_layers,
+            args.max_vocab_size,
+            args.label_smoothing,
+        )
+        updates, opt_state = optim.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, loss_value
+
+    main_key, sk = random.split(main_key)
     for i in range(args.num_epochs):
+        # Shuffle training dataset
         train_dset = train_dset.shuffle(seed=i)
-        val_dset = val_dset.shuffle(seed=i)
-        test_dset = test_dset.shuffle(seed=i)
 
-        batch_indices = get_batch_indices(sk, num_batches, train_dset, args.batch_size)
-
-        for j in range(num_batches):
+        for batch_idx in range(num_batches):
             main_key, subkey = random.split(main_key)
 
             # Get batch
-            low = j
-            high = j + args.batch_size
-            batch_slice = batch_indices[low:high]
+            batch_idx = 0  # TODO: Remove after testing
+            batch_slice = slice(
+                batch_idx * args.batch_size,
+                batch_idx * args.batch_size + args.batch_size,
+            )
             batch = encode(train_dset[batch_slice], tokenizer)
             batch = jnp.array(batch["input_ids"])
 
-            # Get loss
-            batch_loss = softmax_cross_entropy_loss(
-                params,
-                transformer.module_metadata_list,
-                batch,
-                batch,
-                mesh,
-                args.num_layers,
-                args.max_vocab_size,
-                subkey,
-                args.label_smoothing,
-            )
-            print(f"Loss batch {j} epoch {i}: {batch_loss}")
+            # TODO: Insert loss and optim/params update logic
 
     breakpoint()
 

@@ -18,20 +18,20 @@ def verify_module_metadata(
     non-distributed version.
     """
 
-    def init_both(module_metadata):
+    def init_both(mesh, module_metadata):
         dummy = jnp.ones(module_metadata.data_shape, dtype=module_metadata.dtype)
 
-        single_layer = module_metadata.layer(*module_metadata.module_init_args)
-        single_params = single_layer.init(
+        # Get params for single GPU layer
+        single_params = module_metadata.layer.init(
             module_metadata.rng,
             dummy,
             *module_metadata.init_args,
             **module_metadata.init_kwargs,
         )
 
-        dist_layer = ModuleMetadataManager(mesh, 1, [module_metadata])
-        dist_params = dist_layer.init_from_pjit_metadata(const_layer_end_idx=1)
-        dist_layer.forward_from_pjit_metadata(const_layer_end_idx=1)
+        # Get params for distributed layer
+        with maps.Mesh(mesh.devices, mesh.axis_names):
+            dist_params = module_metadata.pjit_init()
 
         # Make sure that parameters are the same
         for single_p, dist_p in zip(
@@ -39,46 +39,71 @@ def verify_module_metadata(
         ):
             assert jnp.allclose(single_p, dist_p)
 
-        return single_params, dist_params, dist_layer
+        return single_params, dist_params
 
-    def forward_both(key, mesh, single_params, dist_layer, dist_params, atol):
-        if dist_layer.module_metadata_list[0].dtype == jnp.int32:
-            data = random.randint(
-                key, dist_layer.module_metadata_list[0].data_shape, minval=2, maxval=40
-            )
+    def forward_both(key, mesh, module_metadata, single_params, dist_params, atol):
+        # Different input data types
+        if module_metadata.dtype == jnp.int32:
+            data = random.randint(key, module_metadata.data_shape, minval=2, maxval=40)
         else:
-            data = random.normal(key, dist_layer.module_metadata_list[0].data_shape)
+            data = random.normal(key, module_metadata.data_shape)
 
-        single_out = dist_layer.module_metadata_list[0].layer.apply(
+        # Get output for single GPU layer
+        single_out = module_metadata.layer.apply(
             single_params,
             data,
-            *dist_layer.module_metadata_list[0].train_args,
-            **dist_layer.module_metadata_list[0].train_kwargs,
+            *module_metadata.train_args,
+            **module_metadata.train_kwargs,
         )  # Shouldn't need rngs, all dropout/batch norm should be off
 
+        # Get output for distributed layer
         with maps.Mesh(mesh.devices, mesh.axis_names):
-            dist_out = dist_layer.module_metadata_list[0].pjit_forward(
-                dist_params, data, None
-            )
+            dist_out = module_metadata.pjit_forward(dist_params, data, None)
 
         return single_out, dist_out, jnp.allclose(single_out, dist_out, atol=atol)
 
-    single_params, dist_params, dist_layer = init_both(
+    single_params, dist_params = init_both(
+        mesh,
         module_metadata,
     )
 
     single_out, dist_out, result = forward_both(
         forward_key,
         mesh,
+        module_metadata,
         single_params,
-        dist_layer,
-        *jax.tree_util.tree_leaves(
-            dist_params,
-            is_leaf=lambda x: True
-            if isinstance(x, flax.core.frozen_dict.FrozenDict)
-            else False,
-        ),
+        dist_params,
         atol,
     )
 
     return single_out, dist_out, result
+
+
+def verify_dist_model(key, mesh, module_metadata_manager):
+    """
+    Verify the correctness of distributed model layers. Note that this
+    does not verify the correctness of ragged pjit forward functions, for
+    example nn.Embed's attend function.
+    """
+    # Check for correctness with non-distributed modules
+    single_outs = {}
+    dist_outs = {}
+    results = {}
+    for module_metadata in module_metadata_manager.module_metadata_list:
+        key, sk = random.split(key)
+
+        module_metadata.train_kwargs["train"] = False
+
+        single_out, dist_out, result = verify_module_metadata(
+            sk, mesh, module_metadata, atol=1e-6
+        )
+
+        module_metadata.train_kwargs["train"] = True
+
+        single_outs[module_metadata.name] = single_out
+        dist_outs[module_metadata.name] = dist_out
+        results[module_metadata.name] = result
+
+    overall = sum(results.values()) == len(results)
+
+    return overall

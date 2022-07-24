@@ -180,17 +180,16 @@ class Layernorm(nn.Module):
 def generic_pjit_init_fn(module_metadata):
     """Generic flax nn.Module init function for params sharded using pjit"""
     fn = pjit(
-        lambda dummy_data: module_metadata.layer.init(
+        lambda: module_metadata.layer.init(
             module_metadata.rng,
-            dummy_data,
+            jnp.ones(module_metadata.data_shape, dtype=module_metadata.dtype),
             *module_metadata.init_args,
             **module_metadata.init_kwargs,
         ),
         in_axis_resources=module_metadata.in_init_pspec,
         out_axis_resources=module_metadata.out_init_pspec,
     )
-    out_tuple = (module_metadata.data_shape, module_metadata.dtype, fn)
-    return out_tuple
+    return fn
 
 
 def generic_pjit_forward_fn(module_metadata):
@@ -251,17 +250,14 @@ class ModuleMetadataManager:
     transformer. Creates both the pjit functions to init parameters, and
     the pjit functions to do forward passes.
     """
+
     mesh: maps.Mesh
     num_layers: int
     module_metadata_list: List[ModuleMetadata]
 
     def __post_init__(self):
         jax.tree_util.tree_map(
-            lambda meta: setattr(
-                meta,
-                "layer",
-                meta.layer(*meta.module_init_args)
-            ),
+            lambda meta: setattr(meta, "layer", meta.layer(*meta.module_init_args)),
             self.module_metadata_list,
         )
 
@@ -297,18 +293,16 @@ class ModuleMetadataManager:
         with maps.Mesh(self.mesh.devices, self.mesh.axis_names):
             # Core layers exist once in model
             core_params = jax.tree_util.tree_map(
-                lambda meta: meta[2](jnp.ones(meta[0], dtype=meta[1])),
+                lambda pjit_init_fn: pjit_init_fn(),
                 core_pjit_fns,
-                is_leaf=lambda x: isinstance(x, tuple) and len(x) == 3,
             )
 
             # Multilayer layers exist num_layers times in model
             multilayer_params = {}
             for i in range(self.num_layers):
                 params = jax.tree_util.tree_map(
-                    lambda meta: meta[2](jnp.ones(meta[0], dtype=meta[1])),
+                    lambda pjit_init_fn: pjit_init_fn(),
                     multilayer_pjit_fns,
-                    is_leaf=lambda x: isinstance(x, tuple) and len(x) == 3,
                 )
                 multilayer_params[f"layer_{i}"] = params
 
@@ -378,14 +372,15 @@ class ModuleMetadataManager:
         return tree_shape
 
 
-def forward(
-    all_params, module_metadata_list, inputs, mesh, num_layers, dropout_rng_key
-):
+def forward(all_params, module_metadata_manager, inputs, mesh, dropout_rng_key):
     """
     Forward pass for transformer. Uses binded params and pjit functions from
     module_metadata_list container.
     """
     qkv_dropout, msa_dropout, mlp_dropout = random.split(dropout_rng_key, num=3)
+
+    # Quick alias
+    module_metadata_list = module_metadata_manager.module_metadata_list
 
     # Forward-pass logic
     # TODO: 1. Check for correctness against regular transformer forward
@@ -407,7 +402,7 @@ def forward(
         # Multilayer params forward
         multilayer_params = all_params["multilayer_params"]
 
-        for i in range(num_layers):
+        for i in range(module_metadata_manager.num_layers):
             ln_msa = module_metadata_list[2].pjit_forward(
                 multilayer_params["layernorm_msa"][i], core_input, None
             )
@@ -440,14 +435,13 @@ def forward(
 
 
 def softmax_cross_entropy_loss(
+    dropout_rng_key,
     all_params,
-    module_metadata_list,
+    module_metadata_manager,
     x_batched,
     labels,
     mesh,
-    num_layers,
     vocab_size,
-    dropout_rng_key,
     label_smoothing,
 ):
     def cross_entropy(x, y):
@@ -459,7 +453,7 @@ def softmax_cross_entropy_loss(
         return -jnp.sum(smooth_label * jnp.clip(jnp.log(x), a_min=-100))
 
     preds_batched = forward(
-        all_params, module_metadata_list, x_batched, mesh, num_layers, dropout_rng_key
+        all_params, module_metadata_manager, x_batched, mesh, dropout_rng_key
     )
 
     softmax_preds_batched = jax.nn.softmax(preds_batched, axis=-1)

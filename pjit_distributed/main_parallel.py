@@ -291,11 +291,21 @@ def main(args):
     num_batches = len(train_dset) // args.batch_size
 
     # Make optim
-    optim = adamw_dist(module_metadata_manager=transformer, learning_rate=args.lr, weight_decay=args.wd)
+    optim = adamw_dist(
+        module_metadata_manager=transformer, learning_rate=args.lr, weight_decay=args.wd
+    )
     opt_state = optim.init(params)
 
     def train_step(
-        key, opt_state, optim, params, module_metadata_manager, batch, labels, vocab_size, label_smoothing
+        key,
+        opt_state,
+        optim,
+        params,
+        module_metadata_manager,
+        batch,
+        labels,
+        vocab_size,
+        label_smoothing,
     ):
         """Calculates loss and applies gradient for one training step"""
         loss_value, grads = jax.value_and_grad(softmax_cross_entropy_loss)(

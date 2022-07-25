@@ -406,12 +406,12 @@ def forward(all_params, module_metadata_manager, inputs, mesh, dropout_rng_key):
 
         embeds = meta_list[0].pjit_forward(all_params["embed_0"], x, None)
 
-        core_input = meta_list[1].pjit_forward(
-            all_params["pos_embed_0"], embeds, None
-        )
+        core_input = meta_list[1].pjit_forward(all_params["pos_embed_0"], embeds, None)
 
         for i in range(module_metadata_manager.num_layers):
-            dropout_rng_key, qkv_dropout, msa_dropout, mlp_dropout = random.split(dropout_rng_key, num=4)
+            dropout_rng_key, qkv_dropout, msa_dropout, mlp_dropout = random.split(
+                dropout_rng_key, num=4
+            )
 
             ln_msa = meta_list[2].pjit_forward(
                 all_params[f"layernorm_msa_{i}"], core_input, None
@@ -437,9 +437,7 @@ def forward(all_params, module_metadata_manager, inputs, mesh, dropout_rng_key):
             )
             core_input = mlp_row_out + msa_res_out
 
-        out = meta_list[0].pjit_forward_attend(
-            all_params["embed_0"], core_input
-        )
+        out = meta_list[0].pjit_forward_attend(all_params["embed_0"], core_input)
 
     return out
 

@@ -101,11 +101,15 @@ def scale_by_adam_dist(
             is_leaf=lambda x: x is None or isinstance(x, tuple),
         )
 
-        assert jax.tree_util.tree_structure(params) \
-            == jax.tree_util.tree_structure(mu) \
+        assert (
+            jax.tree_util.tree_structure(params)
+            == jax.tree_util.tree_structure(mu)
             == jax.tree_util.tree_structure(nu)
+        )
 
-        return optax_transform.ScaleByAdamState(count=jnp.zeros([], jnp.int32), mu=mu, nu=nu)
+        return optax_transform.ScaleByAdamState(
+            count=jnp.zeros([], jnp.int32), mu=mu, nu=nu
+        )
 
     def update_fn(updates, state, params=None):
         # TODO: Why is the first line to `del params`?
@@ -127,7 +131,10 @@ def scale_by_adam_dist(
             ):
                 out = pjit(
                     fn,
-                    in_axis_resources=[in_pspec] * len(tree_map_args),    # tree_map_args could have > 1 params-like args
+                    in_axis_resources=[in_pspec]
+                    * len(
+                        tree_map_args
+                    ),  # tree_map_args could have > 1 params-like args
                     out_axis_resources=out_pspec,
                 )(*tree_map_args)
             return out

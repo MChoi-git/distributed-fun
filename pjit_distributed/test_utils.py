@@ -15,10 +15,7 @@ def verify_module_metadata(
     """
 
     def init_both(mesh, module_metadata):
-        dummy = jnp.ones(
-            module_metadata.data_shape,
-            dtype=module_metadata.dtype
-        )
+        dummy = jnp.ones(module_metadata.data_shape, dtype=module_metadata.dtype)
 
         # Get params for single GPU layer
         single_params = module_metadata.layer.init(

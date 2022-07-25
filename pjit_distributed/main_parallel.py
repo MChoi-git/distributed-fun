@@ -23,6 +23,7 @@ from model_parallel import (
     forward,
     softmax_cross_entropy_loss,
 )
+from sharded_adam import adamw_dist
 from test_utils import verify_module_metadata, verify_dist_model
 
 
@@ -107,6 +108,7 @@ def main(args):
     embed_metadata = ModuleMetadata(
         rng=sk1,
         name="embed",
+        num_layers=1,
         in_init_pspec=None,
         out_init_pspec=PartitionSpec("tp", None),
         in_train_pspec=[PartitionSpec("tp", None), None, None],
@@ -123,6 +125,7 @@ def main(args):
     pos_embed_metadata = ModuleMetadata(
         rng=sk2,
         name="pos_embed",
+        num_layers=1,
         in_init_pspec=None,
         out_init_pspec=PartitionSpec(None, "tp"),
         in_train_pspec=[PartitionSpec("tp", None), None, None],
@@ -139,6 +142,7 @@ def main(args):
     layernorm_msa_metadata = ModuleMetadata(
         rng=sk3,
         name="layernorm_msa",
+        num_layers=args.num_layers,
         in_init_pspec=None,
         out_init_pspec=None,
         in_train_pspec=[None, None, None],
@@ -155,6 +159,7 @@ def main(args):
     msa_attn_metadata = ModuleMetadata(
         rng=sk4,
         name="msa_attn",
+        num_layers=args.num_layers,
         in_init_pspec=None,
         out_init_pspec=PartitionSpec(None, "tp"),
         in_train_pspec=[PartitionSpec(None, "tp"), None, None],
@@ -171,6 +176,7 @@ def main(args):
     msa_mlp_metadata = ModuleMetadata(
         rng=sk5,
         name="msa_mlp",
+        num_layers=args.num_layers,
         in_init_pspec=PartitionSpec(None, None, "tp"),
         out_init_pspec=PartitionSpec("tp", None),
         in_train_pspec=[
@@ -191,6 +197,7 @@ def main(args):
     layernorm_mlp_metadata = ModuleMetadata(
         rng=sk6,
         name="layernorm_mlp",
+        num_layers=args.num_layers,
         in_init_pspec=None,
         out_init_pspec=None,
         in_train_pspec=[None, None, None],
@@ -207,6 +214,7 @@ def main(args):
     mlp_col_metadata = ModuleMetadata(
         rng=sk7,
         name="mlp_col",
+        num_layers=args.num_layers,
         in_init_pspec=None,
         out_init_pspec=PartitionSpec(None, "tp"),
         in_train_pspec=[PartitionSpec(None, "tp"), None, None],
@@ -223,6 +231,7 @@ def main(args):
     mlp_row_metadata = ModuleMetadata(
         rng=sk8,
         name="mlp_row",
+        num_layers=args.num_layers,
         in_init_pspec=PartitionSpec(None, None, "tp"),
         out_init_pspec=PartitionSpec("tp", None),
         in_train_pspec=[
@@ -255,8 +264,8 @@ def main(args):
     # Create transformer model metadata manager
     main_key, verification_key = random.split(main_key)
     transformer = ModuleMetadataManager(mesh, args.num_layers, module_metadata_list)
-    params = transformer.init_from_pjit_metadata(const_layer_end_idx=2)
-    transformer.forward_from_pjit_metadata(const_layer_end_idx=2)
+    params = transformer.init_from_pjit_metadata()
+    transformer.forward_from_pjit_metadata()
 
     # Verify that the pjit layer function is identical to running the layer on
     # one GPU
@@ -281,11 +290,11 @@ def main(args):
     # Start training loop
     num_batches = len(train_dset) // args.batch_size
 
-    # Create optimizer
-    # TODO: Need to find how to shard adam states, since it triples the
-    #       model parameters
-    optim = optax.adamw(learning_rate=args.lr, weight_decay=args.wd)
+    # Make optim
+    optim = adamw_dist(module_metadata_manager=transformer, learning_rate=args.lr, weight_decay=args.wd)
     opt_state = optim.init(params)
+
+    # TODO: Finish distributed adam optimizer impl
 
     def train_step(
         key, opt_state, optim, params, module_metadata_manager, batch, labels, vocab_size, label_smoothing

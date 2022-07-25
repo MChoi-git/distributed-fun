@@ -2,10 +2,6 @@ import jax
 from jax import numpy as jnp, random
 from jax.experimental import maps
 
-import flax
-
-from model_parallel import ModuleMetadataManager
-
 
 def verify_module_metadata(
     forward_key,
@@ -19,7 +15,10 @@ def verify_module_metadata(
     """
 
     def init_both(mesh, module_metadata):
-        dummy = jnp.ones(module_metadata.data_shape, dtype=module_metadata.dtype)
+        dummy = jnp.ones(
+            module_metadata.data_shape,
+            dtype=module_metadata.dtype
+        )
 
         # Get params for single GPU layer
         single_params = module_metadata.layer.init(
@@ -84,6 +83,9 @@ def verify_dist_model(key, mesh, module_metadata_manager):
     Verify the correctness of distributed model layers. Note that this
     does not verify the correctness of ragged pjit forward functions, for
     example nn.Embed's attend function.
+    Note that this verification utility does not use any existing parameter
+    state. All verification of parameter and output correctness is done
+    encapsulated within this utility.
     """
     # Check for correctness with non-distributed modules
     single_outs = {}

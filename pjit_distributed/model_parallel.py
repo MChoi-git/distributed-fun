@@ -219,6 +219,7 @@ class ModuleMetadata:
 
     rng: jax._src.prng.PRNGKeyArray
     name: str
+    num_layers: int  # Number of instances of specific module in whole model
 
     # Partition specs for module.init and module.apply
     in_init_pspec: Union[PartitionSpec, None]
@@ -242,6 +243,39 @@ class ModuleMetadata:
     pjit_init: Union[Callable, None] = None
     pjit_forward: Union[Callable, None] = None
 
+    # Partition specs for optax optimizer functions TransformInitFn,
+    # TransformUpdateFn, and apply_updates
+    in_optim_init_pspec: Union[PartitionSpec, None] = None
+    out_optim_init_pspec: Union[PartitionSpec, None] = None
+    in_optim_update_pspec: Union[PartitionSpec, None] = None
+    out_optim_update_pspec: Union[PartitionSpec, None] = None
+    in_optim_apply_updates_pspec: Union[PartitionSpec, None] = None
+    out_optim_apply_updates_pspec: Union[PartitionSpec, None] = None
+
+    def __post_init__(self):
+        # Maintain the sharding of the parameters, since the output is the same
+        # dimensionality and treedef as the params.
+        if self.in_optim_init_pspec is None:
+            self.in_optim_init_pspec = self.out_init_pspec
+        if self.out_optim_init_pspec is None:
+            self.out_optim_init_pspec = self.out_init_pspec
+
+        # For optim update_fns, input is updates (grads), state, and params
+        # which are all the same dimensionality and treedef. Therefore we
+        # simply repeat the PartitionSpec of the parameters. The output does
+        # not include the params, so the PartitionSpec is only repeated twice.
+        if self.in_optim_update_pspec is None:
+            self.in_optim_update_pspec = [self.out_init_pspec] * 3
+        if self.out_optim_update_pspec is None:
+            self.out_optim_update_pspec = [self.out_init_pspec] * 2
+
+        # Applying updates takes params and updates, and just returns the
+        # updated params.
+        if self.in_optim_apply_updates_pspec is None:
+            self.in_optim_apply_updates_pspec = [self.out_init_pspec] * 2
+        if self.out_optim_apply_updates_pspec is None:
+            self.out_optim_apply_updates_pspec = self.out_init_pspec
+
 
 @dataclass
 class ModuleMetadataManager:
@@ -252,7 +286,7 @@ class ModuleMetadataManager:
     """
 
     mesh: maps.Mesh
-    num_layers: int
+    num_layers: int  # Number of core layer repeats in model
     module_metadata_list: List[ModuleMetadata]
 
     def __post_init__(self):
@@ -269,7 +303,7 @@ class ModuleMetadataManager:
         for meta, fn in zip(self.module_metadata_list, pjit_fns):
             setattr(meta, attribute, fn)
 
-    def init_from_pjit_metadata(self, const_layer_end_idx):
+    def init_from_pjit_metadata(self):
         """
         Initialize the collection of ModuleMetadata objects using their
         initialization arguments. The resulting parameters are sharded
@@ -282,51 +316,33 @@ class ModuleMetadataManager:
             generic_pjit_init_fn, self.module_metadata_list
         )
 
-        # Save for later if needed
+        # Bind pjit functions to each ModuleMetadata object
         self.bind_pjit_fns(pjit_fns, "pjit_init")
 
-        # Separate layers which aren't repeated
-        core_pjit_fns = pjit_fns[:const_layer_end_idx]
-        multilayer_pjit_fns = pjit_fns[const_layer_end_idx:]
+        def init_according_to_num_layers(meta):
+            """
+            Helper fn which simply calls the pjit_init function for the
+            given ModuleMetadata object the number of times specified by the
+            num_layers attribute.
+            """
+            meta_params = {}
+            for i in range(meta.num_layers):
+                meta_params[f"{meta.name}_{i}"] = meta.pjit_init()
+            return meta_params
 
-        # Create sharded parameters for each layer
+        # Create list of layer parameter dicts
         with maps.Mesh(self.mesh.devices, self.mesh.axis_names):
-            # Core layers exist once in model
-            core_params = jax.tree_util.tree_map(
-                lambda pjit_init_fn: pjit_init_fn(),
-                core_pjit_fns,
+            model_params = jax.tree_util.tree_map(
+                init_according_to_num_layers,
+                self.module_metadata_list,
             )
 
-            # Multilayer layers exist num_layers times in model
-            multilayer_params = {}
-            for i in range(self.num_layers):
-                params = jax.tree_util.tree_map(
-                    lambda pjit_init_fn: pjit_init_fn(),
-                    multilayer_pjit_fns,
-                )
-                multilayer_params[f"layer_{i}"] = params
+        # Combine the list of dicts into one dict
+        full_params_dict = {k: v for layer in model_params for k, v in layer.items()}
 
-        # Assign parameters to each metadata module
-        core_params_dict = {}
-        multilayer_params_dict = {}
-        for meta, p in zip(
-            self.module_metadata_list[:const_layer_end_idx], core_params
-        ):
-            core_params_dict[meta.name] = p
-
-        for idx, meta in enumerate(self.module_metadata_list[const_layer_end_idx:]):
-            params_list = []
-            for p in multilayer_params.values():
-                params_list.append(p[idx])
-            multilayer_params_dict[meta.name] = params_list
-
-        full_params_dict = {
-            "core_params": core_params_dict,
-            "multilayer_params": multilayer_params_dict,
-        }
         return full_params_dict
 
-    def forward_from_pjit_metadata(self, const_layer_end_idx):
+    def forward_from_pjit_metadata(self):
         """
         Create the forward pjit functions for each ModuleMetadata object in
         the collection, according to its specific training arguments and

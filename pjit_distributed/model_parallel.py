@@ -393,10 +393,8 @@ def forward(all_params, module_metadata_manager, inputs, mesh, dropout_rng_key):
     Forward pass for transformer. Uses binded params and pjit functions from
     module_metadata_list container.
     """
-    qkv_dropout, msa_dropout, mlp_dropout = random.split(dropout_rng_key, num=3)
-
     # Quick alias
-    module_metadata_list = module_metadata_manager.module_metadata_list
+    meta_list = module_metadata_manager.module_metadata_list
 
     # Forward-pass logic
     # TODO: 1. Check for correctness against regular transformer forward
@@ -406,57 +404,53 @@ def forward(all_params, module_metadata_manager, inputs, mesh, dropout_rng_key):
     with maps.Mesh(mesh.devices, mesh.axis_names):
         x = inputs
 
-        # Core params forward
-        core_params = all_params["core_params"]
+        embeds = meta_list[0].pjit_forward(all_params["embed_0"], x, None)
 
-        embeds = module_metadata_list[0].pjit_forward(core_params["embed"], x, None)
-
-        core_input = module_metadata_list[1].pjit_forward(
-            core_params["pos_embed"], embeds, None
+        core_input = meta_list[1].pjit_forward(
+            all_params["pos_embed_0"], embeds, None
         )
 
-        # Multilayer params forward
-        multilayer_params = all_params["multilayer_params"]
-
         for i in range(module_metadata_manager.num_layers):
-            ln_msa = module_metadata_list[2].pjit_forward(
-                multilayer_params["layernorm_msa"][i], core_input, None
+            dropout_rng_key, qkv_dropout, msa_dropout, mlp_dropout = random.split(dropout_rng_key, num=4)
+
+            ln_msa = meta_list[2].pjit_forward(
+                all_params[f"layernorm_msa_{i}"], core_input, None
             )
-            self_attn = module_metadata_list[3].pjit_forward(
-                multilayer_params["msa_attn"][i], ln_msa, {"dropout": qkv_dropout}
+            self_attn = meta_list[3].pjit_forward(
+                all_params[f"msa_attn_{i}"], ln_msa, {"dropout": qkv_dropout}
             )
-            msa_out = module_metadata_list[4].pjit_forward(
-                multilayer_params["msa_mlp"][i], self_attn, {"dropout": msa_dropout}
+            msa_out = meta_list[4].pjit_forward(
+                all_params[f"msa_mlp_{i}"], self_attn, {"dropout": msa_dropout}
             )
             msa_res_out = msa_out + core_input
 
-            ln_mlp = module_metadata_list[5].pjit_forward(
-                multilayer_params["layernorm_mlp"][i], msa_res_out, None
+            ln_mlp = meta_list[5].pjit_forward(
+                all_params[f"layernorm_mlp_{i}"], msa_res_out, None
             )
-            mlp_col_out = module_metadata_list[6].pjit_forward(
-                multilayer_params["mlp_col"][i], ln_mlp, None
+            mlp_col_out = meta_list[6].pjit_forward(
+                all_params[f"mlp_col_{i}"], ln_mlp, None
             )
-            mlp_row_out = module_metadata_list[7].pjit_forward(
-                multilayer_params["mlp_row"][i],
+            mlp_row_out = meta_list[7].pjit_forward(
+                all_params[f"mlp_row_{i}"],
                 mlp_col_out,
                 {"dropout": mlp_dropout},
             )
             core_input = mlp_row_out + msa_res_out
 
-        out = module_metadata_list[0].pjit_forward_attend(
-            core_params["embed"], core_input
+        out = meta_list[0].pjit_forward_attend(
+            all_params["embed_0"], core_input
         )
 
     return out
 
 
 def softmax_cross_entropy_loss(
-    dropout_rng_key,
     all_params,
     module_metadata_manager,
     x_batched,
     labels,
     mesh,
+    dropout_rng_key,
     vocab_size,
     label_smoothing,
 ):

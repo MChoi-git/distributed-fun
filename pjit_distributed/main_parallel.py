@@ -283,7 +283,7 @@ def main(args):
                 batch["text"],
                 padding="max_length",
                 truncation=True,
-            )
+            )["input_ids"]
         )
         return encoded_batch
 
@@ -294,25 +294,25 @@ def main(args):
     optim = adamw_dist(module_metadata_manager=transformer, learning_rate=args.lr, weight_decay=args.wd)
     opt_state = optim.init(params)
 
-    # TODO: Finish distributed adam optimizer impl
-
     def train_step(
         key, opt_state, optim, params, module_metadata_manager, batch, labels, vocab_size, label_smoothing
     ):
         """Calculates loss and applies gradient for one training step"""
         loss_value, grads = jax.value_and_grad(softmax_cross_entropy_loss)(
-            subkey,
             params,
             transformer,
             batch,
             batch,
             mesh,
-            args.num_layers,
+            subkey,
             args.max_vocab_size,
             args.label_smoothing,
         )
         updates, opt_state = optim.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
+
+        breakpoint()
+
         return params, opt_state, loss_value
 
     main_key, sk = random.split(main_key)
@@ -330,7 +330,18 @@ def main(args):
                 batch_idx * args.batch_size + args.batch_size,
             )
             batch = encode(train_dset[batch_slice], tokenizer)
-            batch = jnp.array(batch["input_ids"])
+
+            params, opt_state, loss_value = train_step(
+                subkey,
+                opt_state,
+                optim,
+                params,
+                transformer,
+                batch,
+                batch,
+                args.max_vocab_size,
+                args.label_smoothing,
+            )
 
             # TODO: Insert loss and optim/params update logic
 

@@ -1,4 +1,5 @@
 from typing import Optional, Any, Union, Callable
+from functools import partial
 
 import jax
 from jax import numpy as jnp
@@ -10,6 +11,7 @@ from optax._src import base as optax_base
 from optax._src import transform as optax_transform
 from optax._src import combine as optax_combine
 from optax._src import alias as optax_alias
+from optax._src import numerics as optax_numerics
 from optax._src import utils as optax_utils
 
 from model_parallel import ModuleMetadataManager
@@ -60,34 +62,50 @@ def scale_by_adam_dist(
 
     def init_fn(params):
         """Init optim state for Adam, ie. mean and stddev arrays of zeros."""
+        # Align each parameter FrozenDict with it's respective pspecs given
+        # by the corresponding ModuleMetadata
         aligned_pspecs = align_pspecs_for_module_layers(module_metadata_manager)
 
-        params_values, params_treedef = jax.tree_util.tree_flatten(
-            params, is_leaf=lambda x: isinstance(x, flax.core.frozen_dict.FrozenDict)
-        )
-        pspecs_values, pspecs_treedef = jax.tree_util.tree_flatten(
-            aligned_pspecs, is_leaf=lambda x: x is None or isinstance(x, tuple)
-        )
-
-        # Make sure that treedefs for params and their corresponding pspecs are
-        # the same
-        assert params_treedef == pspecs_treedef
-
-        breakpoint()
-        # TODO: Tree map jointly over params and pspecs, using function make_mu
-        #       to init the optim state.
-
-        def make_mu(in_pspec, out_pspec, param):
+        def sharded_zeros_like(pspec_tuple, p, **kwargs):
+            """
+            Equivalent to `jax.numpy.zeros_like` but shards the tensors
+            over specified pjit in and out axes.
+            """
+            in_pspec, out_pspec = pspec_tuple
             with maps.Mesh(
                 module_metadata_manager.mesh.devices,
                 module_metadata_manager.mesh.axis_names,
             ):
-                opt_state = pjit(
-                    lambda p: jnp.zeros_like(p, dtype=mu_dtype),
+                zeros_like_fn = pjit(
+                    lambda p: jnp.zeros_like(p, **kwargs),
                     in_axis_resources=in_pspec,
                     out_axis_resources=out_pspec,
-                )(param)
-            return opt_state
+                )
+                opt_zeros_like = jax.tree_util.tree_map(
+                    zeros_like_fn,
+                    p,
+                )
+            return opt_zeros_like
+
+        # Create mu and nu sharded opt states
+        mu = jax.tree_util.tree_map(
+            lambda pspecs, p: sharded_zeros_like(pspecs, p, dtype=mu_dtype),
+            aligned_pspecs,
+            params,
+            is_leaf=lambda x: x is None or isinstance(x, tuple),
+        )
+        nu = jax.tree_util.tree_map(
+            sharded_zeros_like,
+            aligned_pspecs,
+            params,
+            is_leaf=lambda x: x is None or isinstance(x, tuple),
+        )
+
+        assert jax.tree_util.tree_structure(params) \
+            == jax.tree_util.tree_structure(mu) \
+            == jax.tree_util.tree_structure(nu)
+
+        return optax_transform.ScaleByAdamState(count=jnp.zeros([], jnp.int32), mu=mu, nu=nu)
 
     def update_fn(updates, state, params=None):
         # TODO: Why is the first line to `del params`?
@@ -96,7 +114,78 @@ def scale_by_adam_dist(
         calculated updates state and an updated ScaleByAdamState metadata
         object with the updates mean and stddev arrays.
         """
-        pass
+        # Align each parameter FrozenDict with it's respective pspecs given
+        # by the corresponding ModuleMetadata
+        del params  # Not sure why this is here
+        aligned_pspecs = align_pspecs_for_module_layers(module_metadata_manager)
+
+        def eval_shard_fn(pspec_tuple, fn, *tree_map_args):
+            in_pspec, out_pspec = pspec_tuple
+            with maps.Mesh(
+                module_metadata_manager.mesh.devices,
+                module_metadata_manager.mesh.axis_names,
+            ):
+                out = pjit(
+                    fn,
+                    in_axis_resources=[in_pspec] * len(tree_map_args),    # tree_map_args could have > 1 params-like args
+                    out_axis_resources=out_pspec,
+                )(*tree_map_args)
+            return out
+
+        def calculate_updates(mu, nu):
+            return jax.tree_util.tree_map(
+                lambda m, v: m / (jnp.sqrt(v + eps_root) + eps),
+                mu,
+                nu,
+            )
+
+        def apply_sharded_fn_to_params(pspecs, fn, *tree_map_args):
+            out = jax.tree_util.tree_map(
+                lambda ps, *params_like: eval_shard_fn(ps, fn, *params_like),
+                pspecs,
+                *tree_map_args,
+                is_leaf=lambda x: x is None or isinstance(x, tuple),
+            )
+            return out
+
+        mu = apply_sharded_fn_to_params(
+            aligned_pspecs,
+            partial(optax_transform._update_moment, decay=b1, order=1),
+            updates,
+            state.mu,
+        )
+        nu = apply_sharded_fn_to_params(
+            aligned_pspecs,
+            partial(optax_transform._update_moment_per_elem_norm, decay=b2, order=2),
+            updates,
+            state.nu,
+        )
+        count_inc = optax_numerics.safe_int32_increment(state.count)
+        mu_hat = apply_sharded_fn_to_params(
+            aligned_pspecs,
+            partial(optax_transform._bias_correction, decay=b1, count=count_inc),
+            mu,
+        )
+        nu_hat = apply_sharded_fn_to_params(
+            aligned_pspecs,
+            partial(optax_transform._bias_correction, decay=b2, count=count_inc),
+            nu,
+        )
+
+        updates = apply_sharded_fn_to_params(
+            aligned_pspecs,
+            calculate_updates,
+            mu_hat,
+            nu_hat,
+        )
+
+        mu = apply_sharded_fn_to_params(
+            aligned_pspecs,
+            partial(optax_utils.cast_tree, mu_dtype),
+            mu_hat,
+        )
+
+        return updates, optax_transform.ScaleByAdamState(count=count_inc, mu=mu, nu=nu)
 
     return optax_base.GradientTransformation(init_fn, update_fn)
 

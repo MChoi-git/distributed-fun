@@ -130,20 +130,20 @@ class VocabParallelEmbed(nn.Module):
         )
         return out
 
-    def fused_softmax_ce_loss_output_embedding(self, inputs, targets):
-        x = inputs
+    def fused_softmax_ce_loss(self, logits, targets, label_smoothing):
+        x = logits  # (B, S, V/tp)
 
-        output_embeds = self.embed.apply(
-            self.embed.variables, x, method=self.embed.attend
-        )
-
-        softmax_embeds = jax.nn.softmax(output_embeds, axis=-1)
+        softmax_embeds = jax.nn.softmax(x, axis=-1)
 
         def ce_loss(x, y):
-            y_vec = jax.nn.one_hot(y, num_classes=self.vocab_size)
-            return -jnp.sum(y_vec * jnp.log(x))
+            smooth_label = jnp.where(
+                jax.nn.one_hot(y, self.vocab_size) == 0,
+                label_smoothing / (self.vocab_size - 1),
+                1 - label_smoothing,
+            )
+            return -jnp.sum(smooth_label * jnp.clip(jnp.log(x), a_min=-100))
 
-        partial_losses = jax.vmap(ce_loss)(softmax_embeds, targets)
+        partial_losses = jax.vmap(jax.vmap(ce_loss))(softmax_embeds, targets)
 
         return partial_losses
 
@@ -357,19 +357,35 @@ class ModuleMetadataManager:
         self.bind_pjit_fns(pjit_fns, "pjit_forward")
 
         # Ragged forward functions, ie. other methods like nn.Embed's attend
-        # Need to handle these by hand
-        output_embed_attend_fn = pjit(
+        # TODO: Expand the ModuleMetata object to take an arbitrary number of
+        #       module functions, as well as matchin pspecs.
+        attend_fn = pjit(
             lambda params, x: self.module_metadata_list[0].layer.apply(
-                params, x, method=self.module_metadata_list[0].layer.attend
+                params,
+                x,
+                method=self.module_metadata_list[0].layer.attend,
             ),
-            in_axis_resources=[
-                PartitionSpec(None, "tp"),
-                PartitionSpec(None, None, "tp"),
-            ],
-            out_axis_resources=PartitionSpec(None, None, "tp"),
+            in_axis_resources=None,
+            out_axis_resources=PartitionSpec(None, None, "tp")
         )
         setattr(
-            self.module_metadata_list[0], "pjit_forward_attend", output_embed_attend_fn
+            self.module_metadata_list[0], "pjit_attend", attend_fn,
+        )
+        fused_softmax_ce_loss_fn = pjit(
+            lambda logits, targets, label_smoothing: self.module_metadata_list[0].layer.fused_softmax_ce_loss(
+                logits,
+                targets,
+                label_smoothing,
+            ),
+            in_axis_resources=[
+                PartitionSpec(None, None, "tp"),  # Same sharding as embed.__call__
+                None,
+                None,   # Find out way to fix label smoothing
+            ],
+            out_axis_resources=PartitionSpec(None, "tp"),
+        )
+        setattr(
+            self.module_metadata_list[0], "pjit_fused_softmax_ce_loss", fused_softmax_ce_loss_fn,
         )
 
     @staticmethod
@@ -388,7 +404,7 @@ class ModuleMetadataManager:
         return tree_shape
 
 
-def forward(all_params, module_metadata_manager, inputs, mesh, dropout_rng_key):
+def forward(all_params, module_metadata_manager, inputs, targets, mesh, dropout_rng_key, label_smoothing):
     """
     Forward pass for transformer. Uses binded params and pjit functions from
     module_metadata_list container.
@@ -396,11 +412,6 @@ def forward(all_params, module_metadata_manager, inputs, mesh, dropout_rng_key):
     # Quick alias
     meta_list = module_metadata_manager.module_metadata_list
 
-    # Forward-pass logic
-    # TODO: 1. Check for correctness against regular transformer forward
-    #       2. Alias layers better
-    #       3. Do efficient multilayer loops
-    #       4. Check for all-reduces and all-gathers between pjit calls
     with maps.Mesh(mesh.devices, mesh.axis_names):
         x = inputs
 
@@ -437,7 +448,15 @@ def forward(all_params, module_metadata_manager, inputs, mesh, dropout_rng_key):
             )
             core_input = mlp_row_out + msa_res_out
 
-        out = meta_list[0].pjit_forward_attend(all_params["embed_0"], core_input)
+        logits = meta_list[0].pjit_attend(
+            all_params["embed_0"],
+            core_input,
+        )
+        out = meta_list[0].pjit_fused_softmax_ce_loss(
+            logits,
+            targets,
+            label_smoothing,
+        )
 
     return out
 
@@ -452,18 +471,8 @@ def softmax_cross_entropy_loss(
     vocab_size,
     label_smoothing,
 ):
-    def cross_entropy(x, y):
-        smooth_label = jnp.where(
-            jax.nn.one_hot(y, vocab_size) == 0,
-            label_smoothing / (vocab_size - 1),
-            1 - label_smoothing,
-        )
-        return -jnp.sum(smooth_label * jnp.clip(jnp.log(x), a_min=-100))
-
     preds_batched = forward(
-        all_params, module_metadata_manager, x_batched, mesh, dropout_rng_key
+        all_params, module_metadata_manager, x_batched, labels, mesh, dropout_rng_key, label_smoothing
     )
-
-    softmax_preds_batched = jax.nn.softmax(preds_batched, axis=-1)
-
-    return jnp.mean(jax.vmap(cross_entropy)(softmax_preds_batched, labels))
+    # TODO: Outputs NaN when training on the same batch
+    return preds_batched.mean()

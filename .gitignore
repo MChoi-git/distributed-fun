@@ -9,7 +9,7 @@ misc/
 *.txt
 tiny_shakespeare/
 tokenizer_shakespeare/
-tokenizer_wikitext-103/
+tokenizer_*
 dset_json_temp/
 archive/
 checkpoints/

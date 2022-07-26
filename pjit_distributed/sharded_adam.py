@@ -12,6 +12,7 @@ from optax._src import transform as optax_transform
 from optax._src import combine as optax_combine
 from optax._src import alias as optax_alias
 from optax._src import numerics as optax_numerics
+from optax._src import update as optax_update
 from optax._src import utils as optax_utils
 
 from model_parallel import ModuleMetadataManager
@@ -42,6 +43,39 @@ def align_pspecs_for_module_layers(module_metadata_manager):
     )
     params_pspecs = {k: v for layer in params_pspecs for k, v in layer.items()}
     return params_pspecs
+
+
+def apply_sharded_fn_to_params(mesh, pspecs, fn, *tree_map_args):
+    """
+    Converts some function taking params-pytree-like args into a function
+    which operates on a pytree of sharded params arrays, according to the
+    corresponding PartitionSpecs for each parameter FrozenDict group
+    """
+    def eval_shard_fn(mesh, pspec_tuple, fn, *tree_map_args):
+        in_pspec, out_pspec = pspec_tuple
+
+        with maps.Mesh(
+            mesh.devices,
+            mesh.axis_names,
+        ):
+            out = pjit(
+                fn,
+                in_axis_resources=[in_pspec]
+                * len(
+                    tree_map_args
+                ),  # tree_map_args could have > 1 params-like args
+                out_axis_resources=out_pspec,
+            )(*tree_map_args)
+
+        return out
+
+    out = jax.tree_util.tree_map(
+        lambda ps, *params_like: eval_shard_fn(mesh, ps, fn, *params_like),
+        pspecs,
+        *tree_map_args,
+        is_leaf=lambda x: x is None or isinstance(x, tuple),
+    )
+    return out
 
 
 def scale_by_adam_dist(
@@ -123,22 +157,6 @@ def scale_by_adam_dist(
         del params  # Not sure why this is here
         aligned_pspecs = align_pspecs_for_module_layers(module_metadata_manager)
 
-        def eval_shard_fn(pspec_tuple, fn, *tree_map_args):
-            in_pspec, out_pspec = pspec_tuple
-            with maps.Mesh(
-                module_metadata_manager.mesh.devices,
-                module_metadata_manager.mesh.axis_names,
-            ):
-                out = pjit(
-                    fn,
-                    in_axis_resources=[in_pspec]
-                    * len(
-                        tree_map_args
-                    ),  # tree_map_args could have > 1 params-like args
-                    out_axis_resources=out_pspec,
-                )(*tree_map_args)
-            return out
-
         def calculate_updates(mu, nu):
             return jax.tree_util.tree_map(
                 lambda m, v: m / (jnp.sqrt(v + eps_root) + eps),
@@ -146,22 +164,15 @@ def scale_by_adam_dist(
                 nu,
             )
 
-        def apply_sharded_fn_to_params(pspecs, fn, *tree_map_args):
-            out = jax.tree_util.tree_map(
-                lambda ps, *params_like: eval_shard_fn(ps, fn, *params_like),
-                pspecs,
-                *tree_map_args,
-                is_leaf=lambda x: x is None or isinstance(x, tuple),
-            )
-            return out
-
         mu = apply_sharded_fn_to_params(
+            module_metadata_manager.mesh,
             aligned_pspecs,
             partial(optax_transform._update_moment, decay=b1, order=1),
             updates,
             state.mu,
         )
         nu = apply_sharded_fn_to_params(
+            module_metadata_manager.mesh,
             aligned_pspecs,
             partial(optax_transform._update_moment_per_elem_norm, decay=b2, order=2),
             updates,
@@ -169,26 +180,32 @@ def scale_by_adam_dist(
         )
         count_inc = optax_numerics.safe_int32_increment(state.count)
         mu_hat = apply_sharded_fn_to_params(
+            module_metadata_manager.mesh,
             aligned_pspecs,
             partial(optax_transform._bias_correction, decay=b1, count=count_inc),
             mu,
         )
         nu_hat = apply_sharded_fn_to_params(
+            module_metadata_manager.mesh,
             aligned_pspecs,
             partial(optax_transform._bias_correction, decay=b2, count=count_inc),
             nu,
         )
 
         updates = apply_sharded_fn_to_params(
+            module_metadata_manager.mesh,
             aligned_pspecs,
             calculate_updates,
             mu_hat,
             nu_hat,
         )
 
+        # Note that if dtype is not partial'd, then this will return None
+        # mu values
         mu = apply_sharded_fn_to_params(
+            module_metadata_manager.mesh,
             aligned_pspecs,
-            partial(optax_utils.cast_tree, mu_dtype),
+            partial(optax_utils.cast_tree, dtype=mu_dtype),
             mu_hat,
         )
 
@@ -220,3 +237,19 @@ def adamw_dist(
         optax_transform.add_decayed_weights(weight_decay, mask),
         optax_alias._scale_by_learning_rate(learning_rate),
     )
+
+
+def apply_updates_dist(params, updates, module_metadata_manager):
+    """
+    Applies updates to params by adding them together. This is an extension
+    of `optax.apply_udpates` helper function for sharded arrays.
+    """
+    aligned_pspecs = align_pspecs_for_module_layers(module_metadata_manager)
+    out = apply_sharded_fn_to_params(
+        module_metadata_manager.mesh,
+        aligned_pspecs,
+        optax_update.apply_updates,
+        params,
+        updates,
+    )
+    return out

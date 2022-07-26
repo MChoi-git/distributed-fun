@@ -23,7 +23,7 @@ from model_parallel import (
     forward,
     softmax_cross_entropy_loss,
 )
-from sharded_adam import adamw_dist
+from sharded_adam import adamw_dist, apply_updates_dist
 from test_utils import verify_module_metadata, verify_dist_model
 
 
@@ -33,10 +33,10 @@ def parse_args():
     parser.add_argument("--max_vocab_size", type=int, default=30000)
     parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--num_heads", type=int, default=8)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--seq_len", type=int, default=256)
-    parser.add_argument("--hidden", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=2.4e-4)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--seq_len", type=int, default=2048)
+    parser.add_argument("--hidden", type=int, default=256)
+    parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--wd", type=float, default=0.01)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--num_epochs", type=int, default=200)
@@ -60,7 +60,7 @@ def parse_args():
     parser.add_argument(
         "--json_save_dir",
         type=str,
-        default="/dset_json_temp",
+        default="dset_json_temp",
     )
     parser.add_argument("--mesh_x", type=str, default=2)
     parser.add_argument("--mesh_y", type=int, default=1)
@@ -269,12 +269,12 @@ def main(args):
 
     # Verify that the pjit layer function is identical to running the layer on
     # one GPU
-    dist_verification = verify_dist_model(
+    results, overall = verify_dist_model(
         verification_key,
         mesh,
         transformer,
     )
-    assert dist_verification.item() is True, "Dist layer(s) have different" "outputs"
+    assert overall.item() is True, "Dist layer(s) have different" "outputs"
 
     def encode(batch, tokenizer):
         """Helper function using tokenizer to encode dataset batch"""
@@ -286,6 +286,12 @@ def main(args):
             )["input_ids"]
         )
         return encoded_batch
+
+    def left_shift_batch(batch, pad_id=2):
+        pad_column = jnp.ones((batch.shape[0], 1), dtype=jnp.int32) * pad_id
+        shifted_labels = jnp.roll(batch, shift=-1)
+        labels = jnp.concatenate((shifted_labels[:, :-1], pad_column), axis=-1)
+        return labels
 
     # Start training loop
     num_batches = len(train_dset) // args.batch_size
@@ -309,23 +315,21 @@ def main(args):
     ):
         """Calculates loss and applies gradient for one training step"""
         loss_value, grads = jax.value_and_grad(softmax_cross_entropy_loss)(
+        #loss_value = softmax_cross_entropy_loss(    # Testing
             params,
             transformer,
             batch,
-            batch,
+            labels,
             mesh,
             subkey,
             args.max_vocab_size,
             args.label_smoothing,
         )
         updates, opt_state = optim.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-
-        breakpoint()
+        params = apply_updates_dist(params, updates, transformer)
 
         return params, opt_state, loss_value
 
-    main_key, sk = random.split(main_key)
     for i in range(args.num_epochs):
         # Shuffle training dataset
         train_dset = train_dset.shuffle(seed=i)
@@ -340,6 +344,7 @@ def main(args):
                 batch_idx * args.batch_size + args.batch_size,
             )
             batch = encode(train_dset[batch_slice], tokenizer)
+            labels = left_shift_batch(batch)
 
             params, opt_state, loss_value = train_step(
                 subkey,
@@ -348,12 +353,11 @@ def main(args):
                 params,
                 transformer,
                 batch,
-                batch,
+                labels,
                 args.max_vocab_size,
                 args.label_smoothing,
             )
-
-            # TODO: Insert loss and optim/params update logic
+            logger.info(f"Loss: {loss_value}")
 
     breakpoint()
 

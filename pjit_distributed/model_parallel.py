@@ -53,7 +53,7 @@ class ModelParallelMaskedMSA(nn.Module):
 
 class RowParallelLinear(nn.Module):
     hidden: int
-    dropout: int
+    dropout: float
 
     kernel_init: Callable = jax.nn.initializers.lecun_normal()
     bias_init: Callable = jax.nn.initializers.zeros
@@ -63,14 +63,14 @@ class RowParallelLinear(nn.Module):
         out_kernel = self.param(
             "row_kernel",
             self.kernel_init,
-            (self.hidden, self.hidden),
+            (inputs.shape[-1], self.hidden),
         )
         out_bias = self.param("row_bias", self.bias_init, (self.hidden, 1))
 
         x = inputs
 
         # E is full features dimensionality
-        out = jnp.einsum("bse,eE->bsE", x, out_kernel) + out_bias.transpose(1, 0)
+        out = jnp.einsum("...se,eE->...sE", x, out_kernel) + out_bias.transpose(1, 0)
 
         out = nn.Dropout(rate=self.dropout)(out, deterministic=not train)
 
@@ -79,7 +79,7 @@ class RowParallelLinear(nn.Module):
 
 class ColumnParallelLinear(nn.Module):
     hidden: int
-    dropout: int
+    dropout: float
 
     nonlin: Callable = jax.nn.gelu
 
@@ -97,7 +97,7 @@ class ColumnParallelLinear(nn.Module):
 
         x = inputs
 
-        out = jnp.einsum("bse,eE->bsE", x, out_kernel) + out_bias
+        out = jnp.einsum("...se,eE->...sE", x, out_kernel) + out_bias
 
         out = self.nonlin(out)
 
@@ -130,10 +130,14 @@ class VocabParallelEmbed(nn.Module):
         )
         return out
 
-    def fused_softmax_ce_loss(self, logits, targets, label_smoothing):
-        x = logits  # (B, S, V/tp)
+    def fused_softmax_ce_loss(self, inputs, targets, label_smoothing):
+        logits = inputs  # (B, S, V/tp)
 
-        softmax_embeds = jax.nn.softmax(x, axis=-1)
+        high = 1.0 - label_smoothing
+        low = label_smoothing / (self.vocab_size - 1)
+        norm = -(
+            high * jnp.log(high) + (self.vocab_size - 1) * low * jnp.log(low + 1e-20)
+        )
 
         def ce_loss(x, y):
             smooth_label = jnp.where(
@@ -141,11 +145,13 @@ class VocabParallelEmbed(nn.Module):
                 label_smoothing / (self.vocab_size - 1),
                 1 - label_smoothing,
             )
-            return -jnp.sum(smooth_label * jnp.clip(jnp.log(x), a_min=-100))
 
-        partial_losses = jax.vmap(jax.vmap(ce_loss))(softmax_embeds, targets)
+            loss = -jnp.sum(smooth_label * jax.nn.log_softmax(x))
+            return loss
 
-        return partial_losses
+        partial_losses = jax.vmap(jax.vmap(ce_loss))(logits, targets)
+
+        return partial_losses - norm
 
 
 class PositionEmbed(nn.Module):
@@ -264,6 +270,7 @@ class ModuleMetadata:
         # which are all the same dimensionality and treedef. Therefore we
         # simply repeat the PartitionSpec of the parameters. The output does
         # not include the params, so the PartitionSpec is only repeated twice.
+        """
         if self.in_optim_update_pspec is None:
             self.in_optim_update_pspec = [self.out_init_pspec] * 3
         if self.out_optim_update_pspec is None:
@@ -275,6 +282,7 @@ class ModuleMetadata:
             self.in_optim_apply_updates_pspec = [self.out_init_pspec] * 2
         if self.out_optim_apply_updates_pspec is None:
             self.out_optim_apply_updates_pspec = self.out_init_pspec
+        """
 
 
 @dataclass
@@ -474,5 +482,4 @@ def softmax_cross_entropy_loss(
     preds_batched = forward(
         all_params, module_metadata_manager, x_batched, labels, mesh, dropout_rng_key, label_smoothing
     )
-    # TODO: Outputs NaN when training on the same batch
-    return preds_batched.mean()
+    return preds_batched.sum() / labels.size

@@ -36,8 +36,9 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--seq_len", type=int, default=2048)
     parser.add_argument("--hidden", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--wd", type=float, default=0.01)
+    parser.add_argument("--clipping", type=float, default=None)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--num_epochs", type=int, default=200)
     parser.add_argument(
@@ -222,7 +223,7 @@ def main(args):
         layer=ColumnParallelLinear,
         data_shape=(args.batch_size, args.seq_len, args.hidden),
         dtype=jnp.float32,
-        module_init_args=(args.hidden, 0),
+        module_init_args=(args.hidden * 4, 0),
         init_args=(),
         init_kwargs={"train": False},
         train_args=(),
@@ -241,7 +242,7 @@ def main(args):
         ],
         out_train_pspec=PartitionSpec(None, None, "tp"),
         layer=RowParallelLinear,
-        data_shape=(args.batch_size, args.seq_len, args.hidden),
+        data_shape=(args.batch_size, args.seq_len, args.hidden * 4),
         dtype=jnp.float32,
         module_init_args=(args.hidden, 0.1),
         init_args=(),
@@ -298,7 +299,7 @@ def main(args):
 
     # Make optim
     optim = adamw_dist(
-        module_metadata_manager=transformer, learning_rate=args.lr, weight_decay=args.wd
+        module_metadata_manager=transformer, learning_rate=args.lr, weight_decay=args.wd, clipping=args.clipping,
     )
     opt_state = optim.init(params)
 

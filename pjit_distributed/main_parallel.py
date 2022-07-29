@@ -31,12 +31,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Transformer LM args")
     parser.add_argument("--seed", type=int, default=42069)
     parser.add_argument("--max_vocab_size", type=int, default=30000)
-    parser.add_argument("--num_layers", type=int, default=2)
-    parser.add_argument("--num_heads", type=int, default=8)
+    parser.add_argument("--num_layers", type=int, default=12)
+    parser.add_argument("--num_heads", type=int, default=12)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--seq_len", type=int, default=2048)
-    parser.add_argument("--hidden", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--seq_len", type=int, default=512)
+    parser.add_argument("--hidden", type=int, default=768)
+    parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--wd", type=float, default=0.01)
     parser.add_argument("--clipping", type=float, default=None)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
@@ -339,7 +339,6 @@ def main(args):
             main_key, subkey = random.split(main_key)
 
             # Get batch
-            batch_idx = 0  # TODO: Remove after testing
             batch_slice = slice(
                 batch_idx * args.batch_size,
                 batch_idx * args.batch_size + args.batch_size,

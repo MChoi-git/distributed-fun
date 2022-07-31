@@ -1,6 +1,7 @@
-from typing import Optional, Any, Union, Callable
+from typing import Optional, Any, Union, Callable, NamedTuple
 from functools import partial
 
+import chex
 import jax
 from jax import numpy as jnp
 from jax.experimental import maps, PartitionSpec
@@ -18,7 +19,6 @@ from optax._src import utils as optax_utils
 
 from model_parallel import ModuleMetadataManager
 
-
 def align_pspecs_for_module_layers(module_metadata_manager):
     """
     Since modules can occur multiple times in a model, this function returns
@@ -33,8 +33,8 @@ def align_pspecs_for_module_layers(module_metadata_manager):
         pspecs = {}
         for i in range(meta.num_layers):
             pspecs[f"{meta.name}_{i}"] = (
-                meta.in_optim_init_pspec,
-                meta.out_optim_init_pspec,
+                meta.in_optim_pspec,
+                meta.out_optim_pspec,
             )
         return pspecs
 
@@ -61,7 +61,7 @@ def apply_sharded_fn_to_params(mesh, pspecs, fn, *tree_map_args):
         ):
             out = pjit(
                 fn,
-                in_axis_resources=[in_pspec] * len(tree_map_args),  # tree_map_args could have > 1 params-like args
+                in_axis_resources=[in_pspec] * len(tree_map_args),
                 out_axis_resources=out_pspec,
             )(*args)
 
@@ -76,6 +76,54 @@ def apply_sharded_fn_to_params(mesh, pspecs, fn, *tree_map_args):
     return out
 
 
+class ScaleByAdamDistState(NamedTuple):
+    count: chex.Array
+    mu: optax_base.Updates  # chex.ArrayTree
+    nu: optax_base.Updates
+    params_copy: optax_base.Updates
+
+
+def adamw_dist(
+    module_metadata_manager: ModuleMetadataManager,
+    learning_rate: Union[float, optax_base.Schedule],
+    b1: float = 0.9,
+    b2: float = 0.999,
+    eps: float = 1e-8,
+    eps_root: float = 0.0,
+    mu_dtype: Optional[Any] = None,
+    nu_dtype: Optional[Any] = None,
+    params_copy_dtype: Optional[Any] = None,
+    weight_decay: Optional[float] = 1e-4,
+    clipping: Optional[float] = 1.0,
+    loss_scaling: Optional[int] = None,
+) -> optax_base.GradientTransformation:
+    transforms = []
+    transforms.append(
+        scale_by_adam_dist(
+            module_metadata_manager=module_metadata_manager,
+            b1=b1,
+            b2=b2,
+            eps=eps,
+            eps_root=eps_root,
+            mu_dtype=mu_dtype,
+            nu_dtype=nu_dtype,
+            params_copy_dtype=params_copy_dtype,
+        )
+    )
+    if loss_scaling is not None:
+        transforms.append(loss_scaling_dist(loss_scaling, module_metadata_manager))
+
+    if clipping is not None:
+        transforms.append(clip_by_global_norm_dist(clipping, module_metadata_manager))
+
+    transforms.append(scale_dist(-1 * learning_rate, module_metadata_manager))
+
+    if weight_decay is not None:
+        transforms.append(add_decayed_weights_dist(weight_decay, module_metadata_manager))
+
+    return optax_combine.chain(*transforms)
+
+
 def scale_by_adam_dist(
     module_metadata_manager: ModuleMetadataManager,
     b1: float = 0.9,
@@ -83,6 +131,8 @@ def scale_by_adam_dist(
     eps: float = 1e-8,
     eps_root: float = 0.0,
     mu_dtype: Optional[Any] = None,
+    nu_dtype: Optional[Any] = None,
+    params_copy_dtype: Optional[Any] = None,
 ) -> optax_base.GradientTransformation:
     """
     Re-implementation of scale_by_adam from original Optax source code. Here
@@ -91,6 +141,8 @@ def scale_by_adam_dist(
     mean and stddev zero arrays.
     """
     mu_dtype = optax_utils.canonicalize_dtype(mu_dtype)
+    nu_dtype = optax_utils.canonicalize_dtype(nu_dtype)
+    params_copy_dtype = optax_utils.canonicalize_dtype(params_copy_dtype)
 
     def init_fn(params):
         """Init optim state for Adam, ie. mean and stddev arrays of zeros."""
@@ -127,23 +179,23 @@ def scale_by_adam_dist(
             is_leaf=lambda x: x is None or isinstance(x, tuple),
         )
         nu = jax.tree_util.tree_map(
-            sharded_zeros_like,
+            lambda pspecs, p: sharded_zeros_like(pspecs, p, dtype=nu_dtype),
             aligned_pspecs,
             params,
             is_leaf=lambda x: x is None or isinstance(x, tuple),
         )
-
-        assert (
-            jax.tree_util.tree_structure(params)
-            == jax.tree_util.tree_structure(mu)
-            == jax.tree_util.tree_structure(nu)
+        params_copy = apply_sharded_fn_to_params(
+            module_metadata_manager.mesh,
+            aligned_pspecs,
+            partial(optax_utils.cast_tree, dtype=params_copy_dtype),
+            params,
         )
 
-        return optax_transform.ScaleByAdamState(
-            count=jnp.zeros([], jnp.int32), mu=mu, nu=nu
+        return ScaleByAdamDistState(
+            count=jnp.zeros([], jnp.int32), mu=mu, nu=nu, params_copy=params_copy,
         )
 
-    def update_fn(updates, state, params=None):
+    def update_fn(updates, state, params):
         # TODO: Why is the first line to `del params`?
         """
         Update fn implementing the Adam update rule. Returns a tuple of the
@@ -152,7 +204,6 @@ def scale_by_adam_dist(
         """
         # Align each parameter FrozenDict with it's respective pspecs given
         # by the corresponding ModuleMetadata
-        del params  # Not sure why this is here
         aligned_pspecs = align_pspecs_for_module_layers(module_metadata_manager)
 
         def calculate_updates(mu, nu):
@@ -162,21 +213,32 @@ def scale_by_adam_dist(
                 nu,
             )
 
+        # Promote grads to fp32 for calculations
+        promoted_updates = apply_sharded_fn_to_params(
+            module_metadata_manager.mesh,
+            aligned_pspecs,
+            partial(optax_utils.cast_tree, dtype=params_copy_dtype),
+            updates,
+        )
+
         mu = apply_sharded_fn_to_params(
             module_metadata_manager.mesh,
             aligned_pspecs,
             partial(optax_transform.update_moment, decay=b1, order=1),
-            updates,
+            promoted_updates,
             state.mu,
         )
+        # TODO: This function blows up large grad values which are in fp16
         nu = apply_sharded_fn_to_params(
             module_metadata_manager.mesh,
             aligned_pspecs,
             partial(optax_transform.update_moment_per_elem_norm, decay=b2, order=2),
-            updates,
+            promoted_updates,
             state.nu,
         )
+
         count_inc = optax_numerics.safe_int32_increment(state.count)
+
         mu_hat = apply_sharded_fn_to_params(
             module_metadata_manager.mesh,
             aligned_pspecs,
@@ -190,7 +252,7 @@ def scale_by_adam_dist(
             nu,
         )
 
-        updates = apply_sharded_fn_to_params(
+        updates_new = apply_sharded_fn_to_params(
             module_metadata_manager.mesh,
             aligned_pspecs,
             calculate_updates,
@@ -200,50 +262,57 @@ def scale_by_adam_dist(
 
         # Note that if dtype is not partial'd, then this will return None
         # mu updates=values
-        mu = apply_sharded_fn_to_params(
+        mu_new = apply_sharded_fn_to_params(
             module_metadata_manager.mesh,
             aligned_pspecs,
             partial(optax_utils.cast_tree, dtype=mu_dtype),
             mu,
         )
+        nu_new = apply_sharded_fn_to_params(
+            module_metadata_manager.mesh,
+            aligned_pspecs,
+            partial(optax_utils.cast_tree, dtype=nu_dtype),
+            nu,
+        )
+        promoted_params = apply_sharded_fn_to_params(
+            module_metadata_manager.mesh,
+            aligned_pspecs,
+            partial(optax_utils.cast_tree, dtype=params_copy_dtype),
+            params,
+        )
 
-        return updates, optax_transform.ScaleByAdamState(count=count_inc, mu=mu, nu=nu)
+        #nu_inf = sum(jax.tree_util.tree_map(lambda x: jnp.isinf(x).sum(), jax.tree_leaves(nu_new)))
+
+        return updates_new, ScaleByAdamDistState(count=count_inc, mu=mu_new, nu=nu_new, params_copy=promoted_params)
 
     return optax_base.GradientTransformation(init_fn, update_fn)
 
 
-def adamw_dist(
-    module_metadata_manager: ModuleMetadataManager,
-    learning_rate: Union[float, optax_base.Schedule],
-    b1: float = 0.9,
-    b2: float = 0.999,
-    eps: float = 1e-8,
-    eps_root: float = 0.0,
-    mu_dtype: Optional[Any] = None,
-    weight_decay: Optional[float] = 1e-4,
-    clipping: Optional[float] = 1.0,
-    mask: Optional[Union[Any, Callable[[optax_base.Params], Any]]] = None,
-) -> optax_base.GradientTransformation:
-    transforms = []
-    transforms.append(
-        scale_by_adam_dist(
-            module_metadata_manager=module_metadata_manager,
-            b1=b1,
-            b2=b2,
-            eps=eps,
-            eps_root=eps_root,
-            mu_dtype=mu_dtype,
+def apply_updates_dist(half_params, state, updates, module_metadata_manager):
+    """
+    Applies updates to the single precision copy of the model parameters held
+    in state, and returns the new parameters with the same dtypes given by the
+    half precision parameters.
+    """
+    aligned_pspecs = align_pspecs_for_module_layers(module_metadata_manager)
+
+    def apply_updates(single_p, half_p, single_u):
+        return jax.tree_util.tree_map(
+            lambda s, h, u: jnp.asarray(s + u).astype(jnp.asarray(h).dtype),
+            single_p,
+            half_p,
+            single_u,
         )
+
+    out = apply_sharded_fn_to_params(
+        module_metadata_manager.mesh,
+        aligned_pspecs,
+        apply_updates,
+        state[0].params_copy,
+        half_params,
+        updates,
     )
-    if clipping is not None:
-        transforms.append(clip_by_global_norm_dist(clipping, module_metadata_manager))
-
-    transforms.append(scale_dist(-1 * learning_rate, module_metadata_manager))
-
-    if weight_decay is not None:
-        transforms.append(add_decayed_weights_dist(weight_decay, module_metadata_manager))
-
-    return optax_combine.chain(*transforms)
+    return out
 
 
 def clip_by_global_norm_dist(
@@ -340,17 +409,29 @@ def scale_dist(
     return optax_base.GradientTransformation(init_fn, update_fn)
 
 
-def apply_updates_dist(params, updates, module_metadata_manager):
-    """
-    Applies updates to params by adding them together. This is an extension
-    of `optax.apply_udpates` helper function for sharded arrays.
-    """
-    aligned_pspecs = align_pspecs_for_module_layers(module_metadata_manager)
-    out = apply_sharded_fn_to_params(
-        module_metadata_manager.mesh,
-        aligned_pspecs,
-        optax_update.apply_updates,
-        params,
-        updates,
-    )
-    return out
+def loss_scaling_dist(
+    loss_scaling: int,
+    module_metadata_manager: ModuleMetadataManager
+):
+    def init_fn(params):
+        del params
+        return optax_transform.ScaleState()
+
+    def update_fn(updates, state, params=None):
+        del params
+        aligned_pspecs = align_pspecs_for_module_layers(module_metadata_manager)
+
+        def unscale_grads(grads):
+            return jax.tree_util.tree_map(lambda g: 1 / loss_scaling * g, grads)
+
+        updates = apply_sharded_fn_to_params(
+            module_metadata_manager.mesh,
+            aligned_pspecs,
+            unscale_grads,
+            updates,
+        )
+        return updates, state
+
+    return optax_base.GradientTransformation(init_fn, update_fn)
+
+

@@ -1,30 +1,31 @@
 import argparse
 import logging
 
-import jax
 from jax import numpy as jnp, random
-from jax.experimental import maps, PartitionSpec
-import numpy as np
-import optax
-import chex
+from jax.experimental import PartitionSpec
+from flax.core.frozen_dict import FrozenDict
 
 from wikitext_dataset import (
     setup_wikitext_dataset_and_tokenizer,
 )
-from model_parallel import (
+from layers import (
     ModelParallelMaskedMSA,
     RowParallelLinear,
     ColumnParallelLinear,
     VocabParallelEmbed,
     PositionEmbed,
     Layernorm,
+)
+from model_parallel import (
+    get_mesh,
     ModuleMetadata,
     ModuleMetadataManager,
-    forward,
+)
+from verification_utils import verify_dist_model
+from transformer_utils import (
+    TransformerInterface,
     softmax_cross_entropy_loss,
 )
-from sharded_adam import adamw_dist, apply_updates_dist
-from test_utils import verify_module_metadata, verify_dist_model
 
 
 def parse_args():
@@ -40,6 +41,9 @@ def parse_args():
     parser.add_argument("--wd", type=float, default=0.01)
     parser.add_argument("--clipping", type=float, default=None)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
+    parser.add_argument("--loss_scaling", type=int, default=256)
+    parser.add_argument("--precision", type=int, default=16)
+    parser.add_argument("--optim_eps", type=float, default=1e-8)    # use this when training fp16
     parser.add_argument("--num_epochs", type=int, default=200)
     parser.add_argument(
         "--checkpoint_dir",
@@ -63,22 +67,11 @@ def parse_args():
         type=str,
         default="dset_json_temp",
     )
-    parser.add_argument("--mesh_x", type=str, default=2)
+    parser.add_argument("--mesh_x", type=int, default=2)
     parser.add_argument("--mesh_y", type=int, default=1)
     parser.add_argument("--inference", type=int, default=0)
     args = parser.parse_args()
     return args
-
-
-def get_mesh(x, y):
-    mesh_shape = (x, y)  # x: DP, y: MP
-    assert len(jax.devices()) == x * y
-
-    available_devices = jax.devices()
-    devices = np.asarray(available_devices).reshape(*mesh_shape)
-    mesh = maps.Mesh(devices, ("tp", "pp"))
-
-    return mesh
 
 
 def main(args):
@@ -86,6 +79,13 @@ def main(args):
     logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s")
     logger = logging.getLogger("transformer_logger")
     logger.setLevel(logging.INFO)
+
+    if args.precision == 32:
+        int_dtype = jnp.int32
+        float_dtype = jnp.float32
+    else:
+        int_dtype = jnp.int16
+        float_dtype = jnp.float16
 
     # Create dataset and tokenizer
     tokenizer, test_dset, train_dset, val_dset = setup_wikitext_dataset_and_tokenizer(
@@ -98,13 +98,12 @@ def main(args):
     )
 
     # Configure devices and mesh
-    mesh = get_mesh(args.mesh_x, args.mesh_y)
+    mesh_shape = (args.mesh_x, args.mesh_y)
+    mesh_axis_names = ("tp", "pp")
+    mesh = get_mesh(mesh_shape, mesh_axis_names)
 
-    # Make initial RNG
+    # Construct hparams and metadata for every layer type in transformer
     main_key = random.PRNGKey(args.seed)
-
-    # TODO: Can probably get rid of args.batch_size in data_shape, since
-    #       modules are agnostic of batch size
     main_key, sk1, sk2, sk3, sk4, sk5, sk6, sk7, sk8 = random.split(main_key, num=9)
     embed_metadata = ModuleMetadata(
         rng=sk1,
@@ -112,16 +111,17 @@ def main(args):
         num_layers=1,
         in_init_pspec=None,
         out_init_pspec=PartitionSpec("tp", None),
-        in_train_pspec=[PartitionSpec("tp", None), None, None],
+        in_train_pspec=(PartitionSpec("tp", None), None, None),
         out_train_pspec=None,
         layer=VocabParallelEmbed,
         data_shape=(args.batch_size, args.seq_len),
-        dtype=jnp.int32,
+        dtype=int_dtype,
         module_init_args=(args.max_vocab_size, args.hidden),
+        module_init_kwargs=FrozenDict({"param_dtype": float_dtype}),
         init_args=(),
-        init_kwargs={},
+        init_kwargs=FrozenDict({}),
         train_args=(),
-        train_kwargs={},
+        train_kwargs=FrozenDict({}),
     )
     pos_embed_metadata = ModuleMetadata(
         rng=sk2,
@@ -129,16 +129,17 @@ def main(args):
         num_layers=1,
         in_init_pspec=None,
         out_init_pspec=PartitionSpec(None, "tp"),
-        in_train_pspec=[PartitionSpec("tp", None), None, None],
+        in_train_pspec=(PartitionSpec("tp", None), None, None),
         out_train_pspec=None,
         layer=PositionEmbed,
         data_shape=(args.batch_size, args.seq_len, args.hidden),
-        dtype=jnp.float32,
+        dtype=float_dtype,
         module_init_args=(args.seq_len, args.hidden),
+        module_init_kwargs=FrozenDict({"param_dtype": float_dtype}),
         init_args=(),
-        init_kwargs={},
+        init_kwargs=FrozenDict({}),
         train_args=(),
-        train_kwargs={},
+        train_kwargs=FrozenDict({}),
     )
     layernorm_msa_metadata = ModuleMetadata(
         rng=sk3,
@@ -146,16 +147,17 @@ def main(args):
         num_layers=args.num_layers,
         in_init_pspec=None,
         out_init_pspec=None,
-        in_train_pspec=[None, None, None],
+        in_train_pspec=(None, None, None),
         out_train_pspec=None,
         layer=Layernorm,
         data_shape=(args.batch_size, args.seq_len, args.hidden),
-        dtype=jnp.float32,
+        dtype=float_dtype,  # Input will be fp16, but will be promoted to fp32
         module_init_args=(),
+        module_init_kwargs=FrozenDict({"param_dtype": jnp.float32}),
         init_args=(),
-        init_kwargs={},
+        init_kwargs=FrozenDict({}),
         train_args=(),
-        train_kwargs={},
+        train_kwargs=FrozenDict({}),
     )
     msa_attn_metadata = ModuleMetadata(
         rng=sk4,
@@ -163,16 +165,17 @@ def main(args):
         num_layers=args.num_layers,
         in_init_pspec=None,
         out_init_pspec=PartitionSpec(None, "tp"),
-        in_train_pspec=[PartitionSpec(None, "tp"), None, None],
+        in_train_pspec=(PartitionSpec(None, "tp"), None, None),
         out_train_pspec=PartitionSpec(None, None, "tp"),
         layer=ModelParallelMaskedMSA,
         data_shape=(args.batch_size, args.seq_len, args.hidden),
-        dtype=jnp.float32,
+        dtype=float_dtype,
         module_init_args=(args.hidden, args.num_heads, 0.1),
+        module_init_kwargs=FrozenDict({"param_dtype": float_dtype}),
         init_args=(),
-        init_kwargs={"train": False},
+        init_kwargs=FrozenDict({"train": False}),
         train_args=(),
-        train_kwargs={"train": True},
+        train_kwargs=FrozenDict({"train": True}),
     )
     msa_mlp_metadata = ModuleMetadata(
         rng=sk5,
@@ -180,20 +183,21 @@ def main(args):
         num_layers=args.num_layers,
         in_init_pspec=PartitionSpec(None, None, "tp"),
         out_init_pspec=PartitionSpec("tp", None),
-        in_train_pspec=[
+        in_train_pspec=(
             PartitionSpec("tp", None),
             PartitionSpec(None, None, "tp"),
             None,
-        ],
+        ),
         out_train_pspec=PartitionSpec(None, None, "tp"),
         layer=RowParallelLinear,
         data_shape=(args.batch_size, args.seq_len, args.hidden),
-        dtype=jnp.float32,
+        dtype=float_dtype,
         module_init_args=(args.hidden, 0.1),
+        module_init_kwargs=FrozenDict({"param_dtype": float_dtype}),
         init_args=(),
-        init_kwargs={"train": False},
+        init_kwargs=FrozenDict({"train": False}),
         train_args=(),
-        train_kwargs={"train": True},
+        train_kwargs=FrozenDict({"train": True}),
     )
     layernorm_mlp_metadata = ModuleMetadata(
         rng=sk6,
@@ -201,16 +205,17 @@ def main(args):
         num_layers=args.num_layers,
         in_init_pspec=None,
         out_init_pspec=None,
-        in_train_pspec=[None, None, None],
+        in_train_pspec=(None, None, None),
         out_train_pspec=None,
         layer=Layernorm,
         data_shape=(args.batch_size, args.seq_len, args.hidden),
-        dtype=jnp.float32,
+        dtype=float_dtype,
         module_init_args=(),
+        module_init_kwargs=FrozenDict({"param_dtype": jnp.float32}),
         init_args=(),
-        init_kwargs={},
+        init_kwargs=FrozenDict({}),
         train_args=(),
-        train_kwargs={},
+        train_kwargs=FrozenDict({}),
     )
     mlp_col_metadata = ModuleMetadata(
         rng=sk7,
@@ -218,16 +223,17 @@ def main(args):
         num_layers=args.num_layers,
         in_init_pspec=None,
         out_init_pspec=PartitionSpec(None, "tp"),
-        in_train_pspec=[PartitionSpec(None, "tp"), None, None],
+        in_train_pspec=(PartitionSpec(None, "tp"), None, None),
         out_train_pspec=PartitionSpec(None, None, "tp"),
         layer=ColumnParallelLinear,
         data_shape=(args.batch_size, args.seq_len, args.hidden),
-        dtype=jnp.float32,
+        dtype=float_dtype,
         module_init_args=(args.hidden * 4, 0),
+        module_init_kwargs=FrozenDict({"param_dtype": float_dtype}),
         init_args=(),
-        init_kwargs={"train": False},
+        init_kwargs=FrozenDict({"train": False}),
         train_args=(),
-        train_kwargs={"train": True},
+        train_kwargs=FrozenDict({"train": True}),
     )
     mlp_row_metadata = ModuleMetadata(
         rng=sk8,
@@ -235,131 +241,76 @@ def main(args):
         num_layers=args.num_layers,
         in_init_pspec=PartitionSpec(None, None, "tp"),
         out_init_pspec=PartitionSpec("tp", None),
-        in_train_pspec=[
+        in_train_pspec=(
             PartitionSpec("tp", None),
             PartitionSpec(None, None, "tp"),
             None,
-        ],
+        ),
         out_train_pspec=PartitionSpec(None, None, "tp"),
         layer=RowParallelLinear,
         data_shape=(args.batch_size, args.seq_len, args.hidden * 4),
-        dtype=jnp.float32,
+        dtype=float_dtype,
         module_init_args=(args.hidden, 0.1),
+        module_init_kwargs=FrozenDict({"param_dtype": float_dtype}),
         init_args=(),
-        init_kwargs={"train": False},
+        init_kwargs=FrozenDict({"train": False}),
         train_args=(),
-        train_kwargs={"train": True},
+        train_kwargs=FrozenDict({"train": True}),
     )
 
-    module_metadata_list = [
-        embed_metadata,
-        pos_embed_metadata,
-        layernorm_msa_metadata,
-        msa_attn_metadata,
-        msa_mlp_metadata,
-        layernorm_mlp_metadata,
-        mlp_col_metadata,
-        mlp_row_metadata,
-    ]
-
     # Create transformer model metadata manager
-    main_key, verification_key = random.split(main_key)
-    transformer = ModuleMetadataManager(mesh, args.num_layers, module_metadata_list)
-    params = transformer.init_from_pjit_metadata()
-    transformer.forward_from_pjit_metadata()
+    meta = ModuleMetadataManager(
+        mesh,
+        args.num_layers,
+        (
+            embed_metadata,
+            pos_embed_metadata,
+            layernorm_msa_metadata,
+            msa_attn_metadata,
+            msa_mlp_metadata,
+            layernorm_mlp_metadata,
+            mlp_col_metadata,
+            mlp_row_metadata,
+        )
+    )
+    params = meta.init_from_pjit_metadata()
+    meta.init_forward_from_pjit_metadata()
+    meta.init_inference_from_pjit_metadata()
 
     # Verify that the pjit layer function is identical to running the layer on
     # one GPU
+    # TODO: Train kwargs set manually in here, but FrozenDict immutable
+    """
+    main_key, verification_key = random.split(main_key)
     results, overall = verify_dist_model(
         verification_key,
         mesh,
-        transformer,
+        meta,
     )
     assert overall.item() is True, "Dist layer(s) have different" "outputs"
+    """
 
-    def encode(batch, tokenizer):
-        """Helper function using tokenizer to encode dataset batch"""
-        encoded_batch = jnp.array(
-            tokenizer(
-                batch["text"],
-                padding="max_length",
-                truncation=True,
-            )["input_ids"]
-        )
-        return encoded_batch
-
-    def left_shift_batch(batch, pad_id=2):
-        pad_column = jnp.ones((batch.shape[0], 1), dtype=jnp.int32) * pad_id
-        shifted_labels = jnp.roll(batch, shift=-1)
-        labels = jnp.concatenate((shifted_labels[:, :-1], pad_column), axis=-1)
-        return labels
-
-    # Start training loop
-    num_batches = len(train_dset) // args.batch_size
-
-    # Make optim
-    optim = adamw_dist(
-        module_metadata_manager=transformer, learning_rate=args.lr, weight_decay=args.wd, clipping=args.clipping,
+    # Create transformer interface for training, inference, and checkpointing handling
+    transformer_interface = TransformerInterface(
+        seed=6969,
+        module_metadata_manager=meta,
+        train_dset=train_dset,
+        val_dset=val_dset,
+        tokenizer=tokenizer,
+        logger=logger,
     )
-    opt_state = optim.init(params)
-
-    def train_step(
-        key,
-        opt_state,
-        optim,
+    transformer_interface.train(
         params,
-        module_metadata_manager,
-        batch,
-        labels,
-        vocab_size,
-        label_smoothing,
-    ):
-        """Calculates loss and applies gradient for one training step"""
-        loss_value, grads = jax.value_and_grad(softmax_cross_entropy_loss)(
-        #loss_value = softmax_cross_entropy_loss(    # Testing
-            params,
-            transformer,
-            batch,
-            labels,
-            mesh,
-            subkey,
-            args.max_vocab_size,
-            args.label_smoothing,
-        )
-        updates, opt_state = optim.update(grads, opt_state, params)
-        params = apply_updates_dist(params, updates, transformer)
-
-        return params, opt_state, loss_value
-
-    for i in range(args.num_epochs):
-        # Shuffle training dataset
-        train_dset = train_dset.shuffle(seed=i)
-
-        for batch_idx in range(num_batches):
-            main_key, subkey = random.split(main_key)
-
-            # Get batch
-            batch_slice = slice(
-                batch_idx * args.batch_size,
-                batch_idx * args.batch_size + args.batch_size,
-            )
-            batch = encode(train_dset[batch_slice], tokenizer)
-            labels = left_shift_batch(batch)
-
-            params, opt_state, loss_value = train_step(
-                subkey,
-                opt_state,
-                optim,
-                params,
-                transformer,
-                batch,
-                labels,
-                args.max_vocab_size,
-                args.label_smoothing,
-            )
-            logger.info(f"Loss: {loss_value}")
-
-    breakpoint()
+        softmax_cross_entropy_loss,
+        args.num_epochs,
+        args.batch_size,
+        args.lr,
+        args.wd,
+        args.clipping,
+        args.label_smoothing,
+        args.loss_scaling,
+        args.optim_eps,
+    )
 
 
 if __name__ == "__main__":

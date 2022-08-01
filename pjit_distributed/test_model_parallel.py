@@ -155,24 +155,31 @@ def main(args):
     main_key, verify_key = random.split(main_key)
 
     results, overall = verify_dist_model(
-        verify_key, mesh, meta,
+        verify_key,
+        mesh,
+        meta,
     )
 
     assert overall.item() is True
 
     def mse_batched(x_batched, y_batched):
         def mse(x, y):
-            return  0.5 * (x - y) ** 2
+            return 0.5 * (x - y) ** 2
+
         return jnp.mean(jax.vmap(mse)(x_batched, y_batched))
 
-    def forward_mlp(params, meta, inputs, targets, mesh, dropout_rng_key, label_smoothing):
+    def forward_mlp(
+        params, meta, inputs, targets, mesh, dropout_rng_key, label_smoothing
+    ):
         meta_list = meta.module_metadata_list
 
         with maps.Mesh(mesh.devices, mesh.axis_names):
             x = inputs
 
             mlp_col = meta_list[0].pjit_forward(params["mlp_col_0"], x, None)
-            mlp_row = meta_list[1].pjit_forward(params["mlp_row_0"], mlp_col, {"dropout": dropout_rng_key})
+            mlp_row = meta_list[1].pjit_forward(
+                params["mlp_row_0"], mlp_col, {"dropout": dropout_rng_key}
+            )
 
         return mlp_row
 
@@ -202,7 +209,7 @@ def main(args):
             return loss
 
         loss_value, grads = jax.value_and_grad(step)(params, batch, labels)
-        #loss_value, grads = step(params, batch, labels)
+        # loss_value, grads = step(params, batch, labels)
         updates, opt_state = optim.update(grads, opt_state, params)
         params = apply_updates_dist(params, updates, meta)
         return params, opt_state, loss_value
@@ -214,13 +221,19 @@ def main(args):
         def __call__(self, inputs):
             x = inputs
 
-            mlp_col = ColumnParallelLinear(hidden=args.hidden, dropout=0.0)(x, train=False)
-            out = RowParallelLinear(hidden=args.hidden, dropout=0.0)(mlp_col, train=False)
+            mlp_col = ColumnParallelLinear(hidden=args.hidden, dropout=0.0)(
+                x, train=False
+            )
+            out = RowParallelLinear(hidden=args.hidden, dropout=0.0)(
+                mlp_col, train=False
+            )
             return out
 
     main_key, k1, k2 = random.split(main_key, num=3)
     dense_model = DenseModel(hidden=args.hidden)
-    dense_params = dense_model.init(k1, random.normal(k2, shape=(args.batch_size, args.hidden)))
+    dense_params = dense_model.init(
+        k1, random.normal(k2, shape=(args.batch_size, args.hidden))
+    )
 
     dense_optim = optax.adam(learning_rate=args.lr)
     dense_opt_state = dense_optim.init(dense_params)
@@ -251,7 +264,6 @@ def main(args):
             )
             print(f"loss at {i * j}:        {loss_value}")
             print(f"dense loss at {i * j}:  {dense_loss_value}")
-
 
     """
     dist_module = ModuleMetadata(

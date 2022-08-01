@@ -36,7 +36,9 @@ class ModelParallelMaskedMSA(nn.Module):
             self.param_dtype,
         )
 
-        x, qkv_kernel, qkv_bias = promote_dtype(x, qkv_kernel, qkv_bias, dtype=self.dtype)
+        x, qkv_kernel, qkv_bias = promote_dtype(
+            x, qkv_kernel, qkv_bias, dtype=self.dtype
+        )
 
         qkv = jnp.einsum("bse,ef->bsf", x, qkv_kernel) + qkv_bias
 
@@ -83,7 +85,9 @@ class RowParallelLinear(nn.Module):
 
         x = inputs
 
-        x, out_kernel, out_bias = promote_dtype(x, out_kernel, out_bias, dtype=self.dtype)
+        x, out_kernel, out_bias = promote_dtype(
+            x, out_kernel, out_bias, dtype=self.dtype
+        )
 
         # E is full features dimensionality
         out = jnp.einsum("...se,eE->...sE", x, out_kernel) + out_bias.transpose(1, 0)
@@ -114,15 +118,14 @@ class ColumnParallelLinear(nn.Module):
             self.param_dtype,
         )
         out_bias = self.param(
-            "col_bias",
-            self.bias_init,
-            (1, self.hidden),
-            self.param_dtype
+            "col_bias", self.bias_init, (1, self.hidden), self.param_dtype
         )
 
         x = inputs
 
-        x, out_kernel, out_bias = promote_dtype(x, out_kernel, out_bias, dtype=self.dtype)
+        x, out_kernel, out_bias = promote_dtype(
+            x, out_kernel, out_bias, dtype=self.dtype
+        )
 
         out = jnp.einsum("...se,eE->...sE", x, out_kernel) + out_bias
 
@@ -141,7 +144,9 @@ class VocabParallelEmbed(nn.Module):
     param_dtype: Any = jnp.float32
 
     def setup(self):
-        self.embed = nn.Embed(self.vocab_size, self.hidden, param_dtype=self.param_dtype)
+        self.embed = nn.Embed(
+            self.vocab_size, self.hidden, param_dtype=self.param_dtype
+        )
 
     def __call__(self, inputs, *args, **kwargs):
         x = inputs

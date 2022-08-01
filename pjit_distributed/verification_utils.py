@@ -94,7 +94,7 @@ def verify_dist_model(key, mesh, module_metadata_manager):
         module_metadata.train_kwargs["train"] = False
 
         single_out, dist_out, result = verify_module_metadata(
-            sk, mesh, module_metadata, atol=1e-5    # 1e-5 works at 2048 hidden
+            sk, mesh, module_metadata, atol=1e-5  # 1e-5 works at 2048 hidden
         )
 
         module_metadata.train_kwargs["train"] = True

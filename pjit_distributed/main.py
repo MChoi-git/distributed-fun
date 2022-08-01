@@ -21,7 +21,7 @@ from model_parallel import (
     ModuleMetadata,
     ModuleMetadataManager,
 )
-from verification_utils import verify_dist_model
+# from verification_utils import verify_dist_model
 from transformer_utils import (
     TransformerInterface,
     softmax_cross_entropy_loss,
@@ -43,7 +43,9 @@ def parse_args():
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--loss_scaling", type=int, default=256)
     parser.add_argument("--precision", type=int, default=16)
-    parser.add_argument("--optim_eps", type=float, default=1e-8)    # use this when training fp16
+    parser.add_argument(
+        "--optim_eps", type=float, default=1e-8
+    )  # use this when training fp16
     parser.add_argument("--num_epochs", type=int, default=200)
     parser.add_argument(
         "--checkpoint_dir",
@@ -83,9 +85,11 @@ def main(args):
     if args.precision == 32:
         int_dtype = jnp.int32
         float_dtype = jnp.float32
-    else:
+    elif args.precision == 16:
         int_dtype = jnp.int16
         float_dtype = jnp.float16
+    else:
+        raise Exception("No valid precision specified")
 
     # Create dataset and tokenizer
     tokenizer, test_dset, train_dset, val_dset = setup_wikitext_dataset_and_tokenizer(
@@ -271,7 +275,7 @@ def main(args):
             layernorm_mlp_metadata,
             mlp_col_metadata,
             mlp_row_metadata,
-        )
+        ),
     )
     params = meta.init_from_pjit_metadata()
     meta.init_forward_from_pjit_metadata()
@@ -290,9 +294,11 @@ def main(args):
     assert overall.item() is True, "Dist layer(s) have different" "outputs"
     """
 
-    # Create transformer interface for training, inference, and checkpointing handling
+    # Create transformer interface for training, inference, and checkpointing
+    # handling
+    main_key, t_inter_key = random.split(main_key)
     transformer_interface = TransformerInterface(
-        seed=6969,
+        seed=t_inter_key,
         module_metadata_manager=meta,
         train_dset=train_dset,
         val_dset=val_dset,

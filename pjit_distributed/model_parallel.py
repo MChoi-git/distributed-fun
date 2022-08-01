@@ -1,9 +1,8 @@
-from typing import Union, Callable, Tuple, Dict, Any, List
+from typing import Union, Callable, Tuple, Any
 from dataclasses import dataclass
-from functools import partial
 
 import jax
-from jax import numpy as jnp, random
+from jax import numpy as jnp
 from jax.experimental import maps, PartitionSpec
 from jax.experimental.pjit import pjit
 import flax.linen as nn
@@ -51,6 +50,10 @@ def generic_pjit_forward_fn(module_metadata):
 
 
 def generic_pjit_inference_fn(module_metadata):
+    """
+    Generic flax nn.Module inference function for params sharded using
+    pjit.
+    """
     fn = pjit(
         lambda params, data: module_metadata.layer.apply(
             params,
@@ -70,7 +73,6 @@ class ModuleMetadata:
     Metadata object that holds all necessary information for each
     megatron transformer layer.
     """
-
     rng: jax._src.prng.PRNGKeyArray
     name: str
     num_layers: int  # Number of instances of specific module in whole model
@@ -121,38 +123,40 @@ class ModuleMetadata:
         self.inference_kwargs = self.train_kwargs.copy({"train": False})
 
     def __hash__(self):
-        return hash((
-            self.name,
-            self.num_layers,
-            self.in_init_pspec,
-            self.out_init_pspec,
-            self.in_train_pspec,
-            self.out_train_pspec,
-            self.layer,
-            self.data_shape,
-            self.dtype,
-            self.module_init_args,
-            self.init_args,
-            self.init_kwargs,
-            self.train_args,
-            self.train_kwargs,
-            self.inference_args,
-            self.inference_kwargs,
-            self.pjit_init,
-            self.pjit_forward,
-            self.pjit_inference,
-            self.in_optim_pspec,
-            self.out_optim_pspec,
-            self.in_inference_pspec,
-            self.out_inference_pspec,
-        ))
+        return hash(
+            (
+                self.name,
+                self.num_layers,
+                self.in_init_pspec,
+                self.out_init_pspec,
+                self.in_train_pspec,
+                self.out_train_pspec,
+                self.layer,
+                self.data_shape,
+                self.dtype,
+                self.module_init_args,
+                self.init_args,
+                self.init_kwargs,
+                self.train_args,
+                self.train_kwargs,
+                self.inference_args,
+                self.inference_kwargs,
+                self.pjit_init,
+                self.pjit_forward,
+                self.pjit_inference,
+                self.in_optim_pspec,
+                self.out_optim_pspec,
+                self.in_inference_pspec,
+                self.out_inference_pspec,
+            )
+        )
 
     def _tree_flatten(self):
-        pass
+        raise NotImplementedError
 
     @classmethod
     def _tree_unflatten(cls, aux_data, children):
-        pass
+        raise NotImplementedError
 
 
 @dataclass
@@ -168,21 +172,31 @@ class ModuleMetadataManager:
     module_metadata_list: Tuple[ModuleMetadata]
 
     def __post_init__(self):
+        """
+        Initializes the flax layer for each ModuleMetadata object in the
+        list
+        """
         jax.tree_util.tree_map(
-            lambda meta: setattr(meta, "layer", meta.layer(*meta.module_init_args, **meta.module_init_kwargs)),
+            lambda meta: setattr(
+                meta,
+                "layer",
+                meta.layer(*meta.module_init_args, **meta.module_init_kwargs),
+            ),
             self.module_metadata_list,
         )
 
     def __hash__(self):
-        return hash((
-            self.mesh,
-            self.num_layers,
-            *self.module_metadata_list,
-        ))
+        return hash(
+            (
+                self.mesh,
+                self.num_layers,
+                *self.module_metadata_list,
+            )
+        )
 
     def bind_pjit_fns(self, pjit_fns, attribute):
         """
-        Attach the given pjit_fns to the specified attribute in the
+        Bind the given pjit_fns to the specified attribute in the
         ModuleMetadata object.
         """
         for meta, fn in zip(self.module_metadata_list, pjit_fns):
@@ -251,14 +265,18 @@ class ModuleMetadataManager:
                 method=self.module_metadata_list[0].layer.attend,
             ),
             in_axis_resources=None,
-            out_axis_resources=PartitionSpec(None, None, "tp")
+            out_axis_resources=PartitionSpec(None, None, "tp"),
         )
         setattr(
-            self.module_metadata_list[0], "pjit_attend", attend_fn,
+            self.module_metadata_list[0],
+            "pjit_attend",
+            attend_fn,
         )
 
         fused_softmax_ce_loss_fn = pjit(
-            lambda logits, targets, label_smoothing: self.module_metadata_list[0].layer.fused_softmax_ce_loss(
+            lambda logits, targets, label_smoothing: self.module_metadata_list[
+                0
+            ].layer.fused_softmax_ce_loss(
                 logits,
                 targets,
                 label_smoothing,
@@ -266,12 +284,14 @@ class ModuleMetadataManager:
             in_axis_resources=[
                 PartitionSpec(None, None, "tp"),  # Same sharding as embed.__call__
                 None,
-                None,   # Find out way to fix label smoothing
+                None,  # Find out way to fix label smoothing
             ],
             out_axis_resources=PartitionSpec(None, "tp"),
         )
         setattr(
-            self.module_metadata_list[0], "pjit_fused_softmax_ce_loss", fused_softmax_ce_loss_fn,
+            self.module_metadata_list[0],
+            "pjit_fused_softmax_ce_loss",
+            fused_softmax_ce_loss_fn,
         )
 
     def init_inference_from_pjit_metadata(self):

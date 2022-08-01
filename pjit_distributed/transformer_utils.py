@@ -12,19 +12,28 @@ from model_parallel import ModuleMetadataManager
 from sharded_adam import apply_updates_dist, adamw_dist
 
 
+def inspect_params_like(fn, params_like):
+    """
+    Short-hand helper function to inspect pytree of sharded arrays with the
+    same tree structure as model parameters.
+    """
+    return jax.tree_util.tree_map(
+        fn,
+        params_like,
+    )
+
+
 @dataclass
 class TransformerInterface:
-    seed: int
+    seed: jnp.ndarray
     module_metadata_manager: ModuleMetadataManager
     train_dset: Dataset
     val_dset: Dataset
     tokenizer: PreTrainedTokenizerFast
     logger: logging.Logger
 
-    def __post_init__(self):
-        self.rng = random.PRNGKey(self.seed)
-
     def encode(self, batch):
+        """Encode a batch of text using the tokenizer."""
         return jnp.array(
             self.tokenizer(
                 batch["text"],
@@ -34,21 +43,28 @@ class TransformerInterface:
         )
 
     def left_shift_batch(self, batch, pad_id=2):
+        """
+        Left shift the batch of examples and replace the wrapped
+        column with more pad tokens. This is used to generate a batch of
+        labels for each batch.
+        """
         pad_col = jnp.ones((batch.shape[0], 1), dtype=jnp.int32) * pad_id
         shifted_labels = jnp.roll(batch, shift=-1)
         labels = jnp.concatenate((shifted_labels[:, :-1], pad_col), axis=-1)
         return labels
 
     def get_data(self, idx, batch_size, dset):
-        batch_slice = slice(
-            idx * batch_size,
-            idx * batch_size + batch_size
-        )
+        """
+        Given a batch index, return the corresponding batch from the
+        dataset.
+        """
+        batch_slice = slice(idx * batch_size, idx * batch_size + batch_size)
         batch = self.encode(dset[batch_slice])
         labels = self.left_shift_batch(batch)
         return batch, labels
 
     def validate(self, params, loss_fn, batch_size, label_smoothing):
+        """Validate the model with params on the entire validation split"""
         def val_step(params, x_batched, y_batched, vocab_size, label_smoothing, rng):
             loss_value = loss_fn(
                 params,
@@ -68,7 +84,14 @@ class TransformerInterface:
         for b in range(num_batches):
             batch, labels = self.get_data(b, batch_size, self.val_dset)
 
-            loss = val_step(params, batch, labels, self.tokenizer.vocab_size, label_smoothing, random.PRNGKey(0))
+            loss = val_step(
+                params,
+                batch,
+                labels,
+                self.tokenizer.vocab_size,
+                label_smoothing,
+                random.PRNGKey(0),
+            )
 
             val_loss.append(loss)
 
@@ -78,7 +101,23 @@ class TransformerInterface:
 
         return val_loss
 
-    def train(self, params, loss_fn, num_epochs, batch_size, lr, wd, clipping, label_smoothing, loss_scaling, optim_eps):
+    def train(
+        self,
+        params,
+        loss_fn,
+        num_epochs,
+        batch_size,
+        lr,
+        wd,
+        clipping,
+        label_smoothing,
+        loss_scaling,
+        optim_eps,
+    ):
+        """
+        Training function for the model, using an externally defined forward
+        function contained within the loss function.
+        """
         optim = adamw_dist(
             module_metadata_manager=self.module_metadata_manager,
             learning_rate=lr,
@@ -91,7 +130,16 @@ class TransformerInterface:
             params_copy_dtype=jnp.float32,
         )
 
-        def train_step(params, opt_state, meta, x_batched, y_batched, vocab_size, label_smoothing, dropout_rng):
+        def train_step(
+            params,
+            opt_state,
+            meta,
+            x_batched,
+            y_batched,
+            vocab_size,
+            label_smoothing,
+            dropout_rng,
+        ):
             loss_value, grads = jax.value_and_grad(loss_fn)(
                 params,
                 meta,
@@ -104,12 +152,18 @@ class TransformerInterface:
                 train=True,
             )
 
-            nans = sum(jax.tree_util.tree_map(lambda x: jnp.isnan(x).sum(), jax.tree_leaves(grads)))
+            nans = sum(
+                jax.tree_util.tree_map(
+                    lambda x: jnp.isnan(x).sum(), jax.tree_leaves(grads)
+                )
+            )
             assert nans == 0, f"{nans} NaN(s) detected in grads!"
 
             def update_opt(grads, opt_state, params):
                 updates, new_opt_state = optim.update(grads, opt_state, params)
-                params = apply_updates_dist(params, new_opt_state, updates, self.module_metadata_manager)
+                params = apply_updates_dist(
+                    params, new_opt_state, updates, self.module_metadata_manager
+                )
                 return params, new_opt_state
 
             params, opt_state = update_opt(grads, opt_state, params)
@@ -129,17 +183,34 @@ class TransformerInterface:
                 batch, labels = self.get_data(b, batch_size, train_dset)
 
                 params, opt_state, loss_value = train_step(
-                    params, opt_state, self.module_metadata_manager, batch, labels, self.tokenizer.vocab_size, label_smoothing, dropout_key
+                    params,
+                    opt_state,
+                    self.module_metadata_manager,
+                    batch,
+                    labels,
+                    self.tokenizer.vocab_size,
+                    label_smoothing,
+                    dropout_key,
                 )
 
-                self.logger.info(f"Loss epoch {e} batch {b}: {loss_value / loss_scaling}")
+                self.logger.info(
+                    f"Loss epoch {e} batch {b}: {loss_value / loss_scaling}"
+                )
 
             self.validate(params, loss_fn, batch_size, label_smoothing)
 
         return params
 
 
-def forward(all_params, module_metadata_manager, batch, labels, dropout_rng_key, label_smoothing, train=True):
+def forward(
+    all_params,
+    module_metadata_manager,
+    batch,
+    labels,
+    dropout_rng_key,
+    label_smoothing,
+    train=True,
+):
     """
     Forward pass for transformer. Uses binded params and pjit functions from
     module_metadata_list container.
@@ -152,7 +223,9 @@ def forward(all_params, module_metadata_manager, batch, labels, dropout_rng_key,
     def pjit_fn(m):
         return getattr(m, pjit_fn_type)
 
-    with maps.Mesh(module_metadata_manager.mesh.devices, module_metadata_manager.mesh.axis_names):
+    with maps.Mesh(
+        module_metadata_manager.mesh.devices, module_metadata_manager.mesh.axis_names
+    ):
         x = batch
 
         embeds = pjit_fn(meta_list[0])(all_params["embed_0"], x, None)
@@ -212,7 +285,17 @@ def softmax_cross_entropy_loss(
     loss_scaling,
     train=True,
 ):
+    """
+    Softmax cross entropy loss is defined partially in models last layer,
+    but the final reduction is done here.
+    """
     preds_batched = forward(
-        all_params, module_metadata_manager, x_batched, labels, dropout_rng_key, label_smoothing, train
+        all_params,
+        module_metadata_manager,
+        x_batched,
+        labels,
+        dropout_rng_key,
+        label_smoothing,
+        train,
     )
     return preds_batched.sum() / labels.size * loss_scaling

@@ -23,7 +23,9 @@ def setup_wikitext_dataset_and_tokenizer(
 ):
     working_dir = Path(os.getcwd())
     json_save_dir = working_dir / json_save_dir
-    tokenizer_save_dir = working_dir / f"{tokenizer_save_dir}_{seq_len}_{max_vocab_size}"
+    tokenizer_save_dir = (
+        working_dir / f"{tokenizer_save_dir}_{seq_len}_{max_vocab_size}"
+    )
 
     dset_tuple = make_wikitext_dataset(wikitext_script_path, wikitext_name)
     tokenizer = make_wikitext_tokenizer(
@@ -84,9 +86,9 @@ def make_wikitext_tokenizer(
 
     trainer = trainers.BpeTrainer(
         special_tokens=[
-            "[BOS]",    # 0
-            "[EOS]",    # 1
-            "[PAD]",    # 2
+            "[BOS]",  # 0
+            "[EOS]",  # 1
+            "[PAD]",  # 2
         ],
         vocab_size=max_vocab_size,
     )

@@ -9,7 +9,7 @@ from datasets.arrow_dataset import Dataset
 from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
 
 from model_parallel import ModuleMetadataManager
-from sharded_adam import apply_updates_dist, adamw_dist
+from sharded_adam import apply_updates_dist, adamw_dist, dynamic_loss_unscaling, dynamic_loss_nan_check
 
 
 def inspect_params_like(fn, params_like):
@@ -25,7 +25,7 @@ def inspect_params_like(fn, params_like):
 
 @dataclass
 class TransformerInterface:
-    seed: jnp.ndarray
+    rng: jnp.ndarray
     module_metadata_manager: ModuleMetadataManager
     train_dset: Dataset
     val_dset: Dataset
@@ -111,7 +111,10 @@ class TransformerInterface:
         wd,
         clipping,
         label_smoothing,
-        loss_scaling,
+        dynamic_loss_scaling,
+        dynamic_loss_decrease_scale,
+        dynamic_loss_increase_scale,
+        dynamic_loss_increase_window,
         optim_eps,
     ):
         """
@@ -123,14 +126,13 @@ class TransformerInterface:
             learning_rate=lr,
             weight_decay=wd,
             clipping=clipping,
-            loss_scaling=loss_scaling,
             eps=optim_eps,
             mu_dtype=jnp.float32,
             nu_dtype=jnp.float32,
             params_copy_dtype=jnp.float32,
         )
 
-        def train_step(
+        def dynamic_loss_train_step(
             params,
             opt_state,
             meta,
@@ -139,25 +141,38 @@ class TransformerInterface:
             vocab_size,
             label_smoothing,
             dropout_rng,
+            loss_scaling,
         ):
-            loss_value, grads = jax.value_and_grad(loss_fn)(
-                params,
-                meta,
-                x_batched,
-                y_batched,
-                vocab_size,
-                label_smoothing,
-                dropout_rng,
-                loss_scaling,
-                train=True,
-            )
-
-            nans = sum(
-                jax.tree_util.tree_map(
-                    lambda x: jnp.isnan(x).sum(), jax.tree_leaves(grads)
+            nans = 1
+            while nans > 0:
+                loss_value, scaled_grads = jax.value_and_grad(loss_fn)(
+                    params,
+                    meta,
+                    x_batched,
+                    y_batched,
+                    vocab_size,
+                    label_smoothing,
+                    dropout_rng,
+                    loss_scaling=loss_scaling,
+                    train=True,
                 )
+
+                nans = dynamic_loss_nan_check(
+                    scaled_grads,
+                    self.module_metadata_manager,
+                )
+
+                if nans > 0:
+                    loss_scaling /= dynamic_loss_decrease_scale
+                    self.logger.info(f"Detected {nans} NaNs or infs. Decreasing dynamic loss scale to {loss_scaling}")
+
+            self.logger.info(f"Successful dynamic loss scaling at: {loss_scaling}")
+
+            unscaled_grads = dynamic_loss_unscaling(
+                scaled_grads,
+                loss_scaling,
+                self.module_metadata_manager,
             )
-            assert nans == 0, f"{nans} NaN(s) detected in grads!"
 
             def update_opt(grads, opt_state, params):
                 updates, new_opt_state = optim.update(grads, opt_state, params)
@@ -166,14 +181,15 @@ class TransformerInterface:
                 )
                 return params, new_opt_state
 
-            params, opt_state = update_opt(grads, opt_state, params)
+            params, opt_state = update_opt(unscaled_grads, opt_state, params)
 
-            return params, opt_state, loss_value
+            return params, opt_state, loss_scaling, loss_value / loss_scaling
 
         opt_state = optim.init(params)
 
         num_batches = len(self.train_dset) // batch_size
 
+        dynamic_loss_iters = 0
         for e in range(num_epochs):
             train_dset = self.train_dset.shuffle(seed=e)
 
@@ -182,7 +198,7 @@ class TransformerInterface:
 
                 batch, labels = self.get_data(b, batch_size, train_dset)
 
-                params, opt_state, loss_value = train_step(
+                params, opt_state, dynamic_loss_scaling, loss_value  = dynamic_loss_train_step(
                     params,
                     opt_state,
                     self.module_metadata_manager,
@@ -191,11 +207,18 @@ class TransformerInterface:
                     self.tokenizer.vocab_size,
                     label_smoothing,
                     dropout_key,
+                    dynamic_loss_scaling,
                 )
 
+                dynamic_loss_iters += 1
+
                 self.logger.info(
-                    f"Loss epoch {e} batch {b}: {loss_value / loss_scaling}"
+                    f"Loss epoch {e} batch {b}: {loss_value}"
                 )
+
+                if dynamic_loss_iters == dynamic_loss_increase_window:
+                    dynamic_loss_scaling *= dynamic_loss_increase_scale
+                    self.logger.info(f"Increasing dynamic loss scale to {dynamic_loss_scaling}")
 
             self.validate(params, loss_fn, batch_size, label_smoothing)
 
@@ -232,38 +255,42 @@ def forward(
 
         core_input = pjit_fn(meta_list[1])(all_params["pos_embed_0"], embeds, None)
 
-        for i in range(module_metadata_manager.num_layers):
-            dropout_rng_key, qkv_dropout, msa_dropout, mlp_dropout = random.split(
-                dropout_rng_key, num=4
-            )
+        def forward_core_transformer(key, inputs):
+            for i in range(module_metadata_manager.num_layers):
+                dropout_rng_key, qkv_dropout, msa_dropout, mlp_dropout = random.split(
+                    key, num=4
+                )
 
-            ln_msa = pjit_fn(meta_list[2])(
-                all_params[f"layernorm_msa_{i}"], core_input, None
-            )
-            self_attn = pjit_fn(meta_list[3])(
-                all_params[f"msa_attn_{i}"], ln_msa, {"dropout": qkv_dropout}
-            )
-            msa_out = pjit_fn(meta_list[4])(
-                all_params[f"msa_mlp_{i}"], self_attn, {"dropout": msa_dropout}
-            )
-            msa_res_out = msa_out + core_input
+                ln_msa = pjit_fn(meta_list[2])(
+                    all_params[f"layernorm_msa_{i}"], inputs, None
+                )
+                self_attn = pjit_fn(meta_list[3])(
+                    all_params[f"msa_attn_{i}"], ln_msa, {"dropout": qkv_dropout}
+                )
+                msa_out = pjit_fn(meta_list[4])(
+                    all_params[f"msa_mlp_{i}"], self_attn, {"dropout": msa_dropout}
+                )
+                msa_res_out = msa_out + core_input
 
-            ln_mlp = pjit_fn(meta_list[5])(
-                all_params[f"layernorm_mlp_{i}"], msa_res_out, None
-            )
-            mlp_col_out = pjit_fn(meta_list[6])(
-                all_params[f"mlp_col_{i}"], ln_mlp, None
-            )
-            mlp_row_out = pjit_fn(meta_list[7])(
-                all_params[f"mlp_row_{i}"],
-                mlp_col_out,
-                {"dropout": mlp_dropout},
-            )
-            core_input = mlp_row_out + msa_res_out
+                ln_mlp = pjit_fn(meta_list[5])(
+                    all_params[f"layernorm_mlp_{i}"], msa_res_out, None
+                )
+                mlp_col_out = pjit_fn(meta_list[6])(
+                    all_params[f"mlp_col_{i}"], ln_mlp, None
+                )
+                mlp_row_out = pjit_fn(meta_list[7])(
+                    all_params[f"mlp_row_{i}"],
+                    mlp_col_out,
+                    {"dropout": mlp_dropout},
+                )
+                inputs = mlp_row_out + msa_res_out
+            return inputs
+
+        core_output = forward_core_transformer(dropout_rng_key, core_input)
 
         logits = meta_list[0].pjit_attend(
             all_params["embed_0"],
-            core_input,
+            core_output,
         )
         out = meta_list[0].pjit_fused_softmax_ce_loss(
             logits,

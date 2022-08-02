@@ -1,5 +1,6 @@
 from typing import Union, Callable, Tuple, Any
 from dataclasses import dataclass
+from functools import partial
 
 import jax
 from jax import numpy as jnp
@@ -35,17 +36,25 @@ def generic_pjit_forward_fn(module_metadata):
     """Generic flax nn.Module apply function for params sharded using pjit"""
     # fn needs to accept params and data, since the in and out PartitionSpecs
     # need to specify both params and data sharding
+    # TODO: Clean this up by removing train args and kwargs, since they are
+    #       always empty or only contain train=True for dropout.
+    if module_metadata.checkpoint_activations:
+        apply_fn = jax.checkpoint(partial(module_metadata.layer.apply, train=True))
+    else:
+        apply_fn = partial(module_metadata.layer.apply, train=True)
+
     fn = pjit(
-        lambda params, data, rngs: module_metadata.layer.apply(
+        lambda params, data, rngs: apply_fn(
             params,
             data,
             *module_metadata.train_args,
-            **module_metadata.train_kwargs,
+            #**module_metadata.train_kwargs,
             rngs=rngs,
         ),
         in_axis_resources=module_metadata.in_train_pspec,
         out_axis_resources=module_metadata.out_train_pspec,
     )
+
     return fn
 
 
@@ -76,6 +85,7 @@ class ModuleMetadata:
     rng: jax._src.prng.PRNGKeyArray
     name: str
     num_layers: int  # Number of instances of specific module in whole model
+    checkpoint_activations: bool
 
     # Partition specs for module.init and module.apply
     in_init_pspec: Union[PartitionSpec, None]

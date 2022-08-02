@@ -28,20 +28,33 @@ from transformer_utils import (
 )
 
 
+# TODO:
+#   - Dynamic loss scaling (done)
+#   - Validation between epochs
+#   - Abstract away PartitionSpecs
+#   - Inference
+#   - Activation rematerialization (done)
+#   - Lax scan
+#   - Pipeline parallel
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Transformer LM args")
     parser.add_argument("--seed", type=int, default=42069)
     parser.add_argument("--max_vocab_size", type=int, default=30000)
     parser.add_argument("--num_layers", type=int, default=12)
     parser.add_argument("--num_heads", type=int, default=12)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--hidden", type=int, default=768)
     parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--wd", type=float, default=0.01)
     parser.add_argument("--clipping", type=float, default=None)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
-    parser.add_argument("--loss_scaling", type=int, default=256)
+    parser.add_argument("--dynamic_loss_scaling", type=float, default=2048.0)
+    parser.add_argument("--dynamic_loss_decrease_scale", type=float, default=2.0)
+    parser.add_argument("--dynamic_loss_increase_scale", type=float, default=1.5)
+    parser.add_argument("--dynamic_loss_increase_window", type=int, default=5)
     parser.add_argument("--precision", type=int, default=16)
     parser.add_argument(
         "--optim_eps", type=float, default=1e-8
@@ -78,7 +91,11 @@ def parse_args():
 
 def main(args):
     # Configure logger
-    logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s")
+    logging.basicConfig(format="%(asctime)s | "
+                        "%(levelname)s | "
+                        "%(filename)s | "
+                        "%(funcName)s | "
+                        "%(message)s")
     logger = logging.getLogger("transformer_logger")
     logger.setLevel(logging.INFO)
 
@@ -113,6 +130,7 @@ def main(args):
         rng=sk1,
         name="embed",
         num_layers=1,
+        checkpoint_activations=False,
         in_init_pspec=None,
         out_init_pspec=PartitionSpec("tp", None),
         in_train_pspec=(PartitionSpec("tp", None), None, None),
@@ -131,6 +149,7 @@ def main(args):
         rng=sk2,
         name="pos_embed",
         num_layers=1,
+        checkpoint_activations=False,
         in_init_pspec=None,
         out_init_pspec=PartitionSpec(None, "tp"),
         in_train_pspec=(PartitionSpec("tp", None), None, None),
@@ -149,6 +168,7 @@ def main(args):
         rng=sk3,
         name="layernorm_msa",
         num_layers=args.num_layers,
+        checkpoint_activations=True,
         in_init_pspec=None,
         out_init_pspec=None,
         in_train_pspec=(None, None, None),
@@ -167,6 +187,7 @@ def main(args):
         rng=sk4,
         name="msa_attn",
         num_layers=args.num_layers,
+        checkpoint_activations=True,
         in_init_pspec=None,
         out_init_pspec=PartitionSpec(None, "tp"),
         in_train_pspec=(PartitionSpec(None, "tp"), None, None),
@@ -185,6 +206,7 @@ def main(args):
         rng=sk5,
         name="msa_mlp",
         num_layers=args.num_layers,
+        checkpoint_activations=True,
         in_init_pspec=PartitionSpec(None, None, "tp"),
         out_init_pspec=PartitionSpec("tp", None),
         in_train_pspec=(
@@ -207,6 +229,7 @@ def main(args):
         rng=sk6,
         name="layernorm_mlp",
         num_layers=args.num_layers,
+        checkpoint_activations=True,
         in_init_pspec=None,
         out_init_pspec=None,
         in_train_pspec=(None, None, None),
@@ -225,6 +248,7 @@ def main(args):
         rng=sk7,
         name="mlp_col",
         num_layers=args.num_layers,
+        checkpoint_activations=True,
         in_init_pspec=None,
         out_init_pspec=PartitionSpec(None, "tp"),
         in_train_pspec=(PartitionSpec(None, "tp"), None, None),
@@ -243,6 +267,7 @@ def main(args):
         rng=sk8,
         name="mlp_row",
         num_layers=args.num_layers,
+        checkpoint_activations=True,
         in_init_pspec=PartitionSpec(None, None, "tp"),
         out_init_pspec=PartitionSpec("tp", None),
         in_train_pspec=(
@@ -298,7 +323,7 @@ def main(args):
     # handling
     main_key, t_inter_key = random.split(main_key)
     transformer_interface = TransformerInterface(
-        seed=t_inter_key,
+        rng=t_inter_key,
         module_metadata_manager=meta,
         train_dset=train_dset,
         val_dset=val_dset,
@@ -314,7 +339,10 @@ def main(args):
         args.wd,
         args.clipping,
         args.label_smoothing,
-        args.loss_scaling,
+        args.dynamic_loss_scaling,
+        args.dynamic_loss_decrease_scale,
+        args.dynamic_loss_increase_scale,
+        args.dynamic_loss_increase_window,
         args.optim_eps,
     )
 

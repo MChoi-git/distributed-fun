@@ -4,7 +4,7 @@ from functools import partial
 import chex
 import jax
 from jax import numpy as jnp
-from jax.experimental import maps
+from jax.experimental import maps, PartitionSpec
 from jax.experimental.pjit import pjit
 import optax
 from optax._src import base as optax_base
@@ -17,7 +17,7 @@ from optax._src import utils as optax_utils
 from model_parallel import ModuleMetadataManager
 
 
-def align_pspecs_for_module_layers(module_metadata_manager):
+def align_pspecs_for_module_layers(module_metadata_manager, scalar=False):
     """
     Since modules can occur multiple times in a model, this function returns
     a list of partition specs for a module_metadat object, repeated num_layers
@@ -32,7 +32,7 @@ def align_pspecs_for_module_layers(module_metadata_manager):
         for i in range(meta.num_layers):
             pspecs[f"{meta.name}_{i}"] = (
                 meta.in_optim_pspec,
-                meta.out_optim_pspec,
+                meta.out_optim_pspec if scalar is False else None,
             )
         return pspecs
 
@@ -315,8 +315,6 @@ def scale_by_adam_dist(
             params,
         )
 
-        # nu_inf = sum(jax.tree_util.tree_map(lambda x: jnp.isinf(x).sum(), jax.tree_leaves(nu_new)))
-
         return updates_new, ScaleByAdamDistState(
             count=count_inc, mu=mu_new, nu=nu_new, params_copy=promoted_params
         )
@@ -495,3 +493,54 @@ def loss_scaling_dist(
         return updates, state
 
     return optax_base.GradientTransformation(init_fn, update_fn)
+
+
+def dynamic_loss_unscaling(
+    grads: chex.Array,
+    dynamic_loss_scale: int,
+    module_metadata_manager: ModuleMetadataManager,
+):
+    aligned_pspecs = align_pspecs_for_module_layers(
+        module_metadata_manager,
+    )
+
+    def unscale_grads(grads):
+        return jax.tree_util.tree_map(
+            lambda g: 1 / dynamic_loss_scale * g,
+            grads,
+        )
+
+    unscaled_grads = apply_sharded_fn_to_params(
+        module_metadata_manager.mesh,
+        aligned_pspecs,
+        unscale_grads,
+        grads,
+    )
+
+    return unscaled_grads
+
+
+def dynamic_loss_nan_check(
+    grads: chex.Array,
+    module_metadata_manager: ModuleMetadataManager,
+):
+    aligned_pspecs = align_pspecs_for_module_layers(
+        module_metadata_manager,
+        scalar=True,
+    )
+
+    def accumulate_nans(grads):
+        n = jax.tree_util.tree_map(
+            lambda g: (~jnp.isfinite(g)).sum(),
+            jax.tree_leaves(grads),
+        )
+        return sum(n)
+
+    nans = apply_sharded_fn_to_params(
+        module_metadata_manager.mesh,
+        aligned_pspecs,
+        accumulate_nans,
+        grads,
+    )
+
+    return sum(jax.tree_leaves(nans))

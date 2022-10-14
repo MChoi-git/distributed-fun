@@ -36,6 +36,10 @@ from transformer_utils import (
 #   - Activation rematerialization (done)
 #   - Lax scan
 #   - Pipeline parallel
+#   - jax.experimental.pjit.with_sharding_constraint
+# Notes:
+#   - Max batch size on 4 GPU is 18
+#   - Max batch size on 2 GPU is 16
 
 
 def parse_args():
@@ -44,13 +48,13 @@ def parse_args():
     parser.add_argument("--max_vocab_size", type=int, default=30000)
     parser.add_argument("--num_layers", type=int, default=12)
     parser.add_argument("--num_heads", type=int, default=12)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=12)
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--hidden", type=int, default=768)
     parser.add_argument("--lr", type=float, default=6e-4)
     parser.add_argument("--wd", type=float, default=0.01)
     parser.add_argument("--clipping", type=float, default=None)
-    parser.add_argument("--label_smoothing", type=float, default=0.1)
+    parser.add_argument("--label_smoothing", type=float, default=0.0)
     parser.add_argument("--dynamic_loss_scaling", type=float, default=2048.0)
     parser.add_argument("--dynamic_loss_decrease_scale", type=float, default=2.0)
     parser.add_argument("--dynamic_loss_increase_scale", type=float, default=1.5)
@@ -85,6 +89,7 @@ def parse_args():
     parser.add_argument("--mesh_x", type=int, default=2)
     parser.add_argument("--mesh_y", type=int, default=1)
     parser.add_argument("--inference", type=int, default=0)
+    parser.add_argument("--debug", type=int, default=0)
     args = parser.parse_args()
     return args
 
@@ -328,7 +333,10 @@ def main(args):
         train_dset=train_dset,
         val_dset=val_dset,
         tokenizer=tokenizer,
+        float_dtype=float_dtype,
+        int_dtype=int_dtype,
         logger=logger,
+        debug=True if args.debug == 1 else False,
     )
     transformer_interface.train(
         params,

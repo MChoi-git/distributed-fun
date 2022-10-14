@@ -283,20 +283,19 @@ class ModuleMetadataManager:
             attend_fn,
         )
 
+        fused_softmax_ce_pjit_fn = partial(
+            self.module_metadata_list[0].layer.fused_softmax_ce_loss,
+            tp=self.mesh.shape["tp"],
+        )
         fused_softmax_ce_loss_fn = pjit(
-            lambda logits, targets, label_smoothing: self.module_metadata_list[
-                0
-            ].layer.fused_softmax_ce_loss(
-                logits,
-                targets,
-                label_smoothing,
-            ),
+            fused_softmax_ce_pjit_fn,
             in_axis_resources=[
                 PartitionSpec(None, None, "tp"),  # Same sharding as embed.__call__
                 None,
-                None,  # Find out way to fix label smoothing
+                None,  # TODO: Find out way to fix label smoothing
             ],
             out_axis_resources=PartitionSpec(None, "tp"),
+            #out_axis_resources=None,
         )
         setattr(
             self.module_metadata_list[0],

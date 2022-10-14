@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import logging
 from functools import partial
+from typing import Any
 
 import jax
 from jax import random, numpy as jnp
@@ -30,7 +31,11 @@ class TransformerInterface:
     train_dset: Dataset
     val_dset: Dataset
     tokenizer: PreTrainedTokenizerFast
+    float_dtype: Any
+    int_dtype: Any
     logger: logging.Logger
+
+    debug: bool = False
 
     def encode(self, batch):
         """Encode a batch of text using the tokenizer."""
@@ -39,7 +44,8 @@ class TransformerInterface:
                 batch["text"],
                 padding="max_length",
                 truncation=True,
-            )["input_ids"]
+            )["input_ids"],
+            dtype=self.int_dtype,
         )
 
     def left_shift_batch(self, batch, pad_id=2):
@@ -48,7 +54,7 @@ class TransformerInterface:
         column with more pad tokens. This is used to generate a batch of
         labels for each batch.
         """
-        pad_col = jnp.ones((batch.shape[0], 1), dtype=jnp.int32) * pad_id
+        pad_col = jnp.ones((batch.shape[0], 1), dtype=self.int_dtype) * pad_id
         shifted_labels = jnp.roll(batch, shift=-1)
         labels = jnp.concatenate((shifted_labels[:, :-1], pad_col), axis=-1)
         return labels
@@ -145,17 +151,31 @@ class TransformerInterface:
         ):
             nans = 1
             while nans > 0:
-                loss_value, scaled_grads = jax.value_and_grad(loss_fn)(
-                    params,
-                    meta,
-                    x_batched,
-                    y_batched,
-                    vocab_size,
-                    label_smoothing,
-                    dropout_rng,
-                    loss_scaling=loss_scaling,
-                    train=True,
-                )
+                if self.debug:
+                    loss_value = loss_fn(
+                        params,
+                        meta,
+                        x_batched,
+                        y_batched,
+                        vocab_size,
+                        label_smoothing,
+                        dropout_rng,
+                        loss_scaling=loss_scaling,
+                        train=True,
+                    )
+                    breakpoint()
+                else:
+                    loss_value, scaled_grads = jax.value_and_grad(loss_fn)(
+                        params,
+                        meta,
+                        x_batched,
+                        y_batched,
+                        vocab_size,
+                        label_smoothing,
+                        dropout_rng,
+                        loss_scaling=loss_scaling,
+                        train=True,
+                    )
 
                 nans = dynamic_loss_nan_check(
                     scaled_grads,
@@ -219,6 +239,7 @@ class TransformerInterface:
                 if dynamic_loss_iters == dynamic_loss_increase_window:
                     dynamic_loss_scaling *= dynamic_loss_increase_scale
                     self.logger.info(f"Increasing dynamic loss scale to {dynamic_loss_scaling}")
+                    dynamic_loss_iters = 0
 
             self.validate(params, loss_fn, batch_size, label_smoothing)
 
@@ -292,11 +313,18 @@ def forward(
             all_params["embed_0"],
             core_output,
         )
+        jaxpr_loss = jax.make_jaxpr(
+            meta_list[0].pjit_fused_softmax_ce_loss
+        )(logits, labels, label_smoothing)
+
         out = meta_list[0].pjit_fused_softmax_ce_loss(
             logits,
             labels,
             label_smoothing,
         )
+        #breakpoint()
+
+        #print(jaxpr_loss)
 
     return out
 
@@ -325,4 +353,4 @@ def softmax_cross_entropy_loss(
         label_smoothing,
         train,
     )
-    return preds_batched.sum() / labels.size * loss_scaling
+    return preds_batched.mean() * loss_scaling
